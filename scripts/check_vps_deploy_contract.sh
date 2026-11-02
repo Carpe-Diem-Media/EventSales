@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Contract assertions intentionally match literal shell and Compose syntax.
+# shellcheck disable=SC2016
 set -Eeuo pipefail
 set +x
 export LC_ALL=C
@@ -33,6 +35,9 @@ RUNTIME_CONFIG="$ROOT/config/runtime.exs"
 SECRET_GENERATOR="$ROOT/deploy/vps/data-plane/scripts/generate-secrets.sh"
 RUNTIME_RENDERER="$ROOT/deploy/vps/data-plane/scripts/render-runtime-config.sh"
 POSTGRES_BOOTSTRAP="$ROOT/deploy/vps/data-plane/scripts/bootstrap-postgres.sh"
+VPS_PRODUCTION_RUNBOOK="$ROOT/docs/deployment/vps-production.md"
+DATA_PLANE_README="$ROOT/deploy/vps/data-plane/README.md"
+PRODUCTION_PLAN="$ROOT/docs/superpowers/plans/2026-10-20-d1-vps-production-implementation.md"
 RECOVERY_WRAPPER="$ROOT/deploy/vps/operator/agent-eventsales-v3-recover-postgres"
 RECOVERY_SUDOERS="$ROOT/deploy/vps/operator/agent-eventsales-v3-recover-postgres.sudoers"
 BOOTSTRAP_V2_WRAPPER="$ROOT/deploy/vps/operator/agent-eventsales-v3-bootstrap-postgres-v2"
@@ -60,6 +65,9 @@ for source_file in \
   "$SECRET_GENERATOR" \
   "$RUNTIME_RENDERER" \
   "$POSTGRES_BOOTSTRAP" \
+  "$VPS_PRODUCTION_RUNBOOK" \
+  "$DATA_PLANE_README" \
+  "$PRODUCTION_PLAN" \
   "$RECOVERY_WRAPPER" \
   "$RECOVERY_SUDOERS" \
   "$BOOTSTRAP_V2_WRAPPER" \
@@ -69,6 +77,43 @@ for source_file in \
   "${DEPLOY_PROBE_SCRIPTS[@]}"; do
   [[ -f "$source_file" && -r "$source_file" ]] || fail SOURCE_FILE_MISSING
 done
+
+# Keep V3's PostgreSQL structural proof separate from V5 runtime proof authority.
+grep -Fqx 'PROBE_SCRIPT="$SCRIPT_DIR/probe-postgres.sh"' "$POSTGRES_BOOTSTRAP" || fail V3_POSTGRES_PROBE_PATH
+grep -Fq 'if EVENTSALES_SECRET_DIR="$secret_dir" "$PROBE_SCRIPT" >"$probe_output_file" 2>&1; then' "$POSTGRES_BOOTSTRAP" || fail V3_POSTGRES_PROBE_INVOKED
+grep -Fq 'if ((probe_status != 0)) || ! grep -qx '\''POSTGRES_PROBE=PASS'\'' "$probe_output_file"; then' "$POSTGRES_BOOTSTRAP" || fail V3_POSTGRES_PROBE_PASS_REQUIRED
+
+v5_runbook_section=$(awk '
+  /^### C \/ V5: prove and accept the data plane$/ { in_v5 = 1; next }
+  in_v5 && /^### D \/ V6:/ { exit }
+  in_v5 { print }
+' "$VPS_PRODUCTION_RUNBOOK")
+[[ -n "$v5_runbook_section" ]] || fail V5_RUNBOOK_SECTION
+grep -Fq 'POSTGRESQL_STRUCTURAL_PROOF=ACCEPTED_FROM_V3' <<<"$v5_runbook_section" || fail V5_RUNBOOK_V3_POSTGRES_ACCEPTANCE
+grep -Fq '`probe-postgres.sh` MUST NOT be rerun in V5.' <<<"$v5_runbook_section" || fail V5_RUNBOOK_POSTGRES_RERUN
+if grep -Fq 'Use `probe-postgres.sh`, `probe-pgbouncer.sh`, and `probe-redis.sh`' <<<"$v5_runbook_section"; then
+  fail V5_RUNBOOK_POSTGRES_RERUN
+fi
+grep -Fq 'Execute only `probe-pgbouncer.sh` and `probe-redis.sh`.' <<<"$v5_runbook_section" || fail V5_RUNBOOK_RUNTIME_PROBES
+grep -Fq 'V5 authority is consumed immediately before the first `probe-pgbouncer.sh` invocation.' <<<"$v5_runbook_section" || fail V5_RUNBOOK_AUTHORITY_CONSUMPTION
+
+grep -Fq '`probe-postgres.sh` is owned by V3.' "$DATA_PLANE_README" || fail README_POSTGRES_PROBE_OWNER
+grep -Fq '`bootstrap-postgres.sh` invokes it during `PHASE_4_PROBE` and requires exact `POSTGRES_PROBE=PASS` before setting `BOOTSTRAPPED`.' "$DATA_PLANE_README" || fail README_POSTGRES_BOOTSTRAP_PROOF
+grep -Fq '`probe-postgres.sh` MUST NOT be rerun during V5.' "$DATA_PLANE_README" || fail README_POSTGRES_PROBE_RERUN
+grep -Fq '`probe-pgbouncer.sh` is owned by V5.' "$DATA_PLANE_README" || fail README_PGBOUNCER_PROBE_OWNER
+grep -Fq '`probe-redis.sh` is owned by V5.' "$DATA_PLANE_README" || fail README_REDIS_PROBE_OWNER
+grep -Fq 'Each V5 runtime probe is one-shot.' "$DATA_PLANE_README" || fail README_V5_PROBE_ONESHOT
+
+plan_v5_section=$(awk '
+  /^## Gate V5/ { in_v5 = 1; next }
+  in_v5 && /^## Gate V6/ { exit }
+  in_v5 { print }
+' "$PRODUCTION_PLAN")
+[[ -n "$plan_v5_section" ]] || fail PLAN_V5_SECTION
+grep -Fq 'Reuse the accepted V3 PostgreSQL structural-proof result.' <<<"$plan_v5_section" || fail PLAN_V5_POSTGRES_RERUN
+grep -Fq 'Do not rerun `probe-postgres.sh` in V5.' <<<"$plan_v5_section" || fail PLAN_V5_POSTGRES_RERUN
+[[ $(grep -Fc 'probe-postgres.sh' <<<"$plan_v5_section") -eq 1 ]] || fail PLAN_V5_POSTGRES_RERUN
+grep -Fq 'Run the PgBouncer and Redis V5 proofs once, in that order.' <<<"$plan_v5_section" || fail PLAN_V5_RUNTIME_PROOFS
 
 [[ -x "$RECOVERY_WRAPPER" && ! -L "$RECOVERY_WRAPPER" ]] || fail RECOVERY_WRAPPER_TYPE
 bash -n "$RECOVERY_WRAPPER" || fail RECOVERY_WRAPPER_SYNTAX
@@ -182,6 +227,8 @@ secret_source_gate() {
       fail COMMITTED_SECRET_LITERAL
     fi
 
+    # This loop reads source_file only; it does not rewrite the input.
+    # shellcheck disable=SC2094
     while IFS= read -r line || [[ -n "$line" ]]; do
       lower_line="${line,,}"
       if [[ "$lower_line" =~ (password|passwd|pgpassword|pgpassfile|token|api[_-]?key|client[_-]?secret|secret|credential|private[_-]?key|secret_key_base|release_cookie)[[:space:]]*[:=][[:space:]]*([^[:space:]]+) ]]; then
@@ -711,4 +758,14 @@ check_redis_acl || fail REDIS_ACL
 python_check APP_BASE "$TMP_DIR/app-base.json"
 python_check APP_INGRESS "$TMP_DIR/app-ingress.json"
 
+printf 'V3_BOOTSTRAP_INVOKES_POSTGRES_PROBE=YES\n'
+printf 'V3_BOOTSTRAP_REQUIRES_POSTGRES_PROBE_PASS=YES\n'
+printf 'V5_RUNBOOK_EXECUTES_POSTGRES_PROBE=NO\n'
+printf 'V5_RUNBOOK_EXECUTES_PGBOUNCER_PROBE=YES\n'
+printf 'V5_RUNBOOK_EXECUTES_REDIS_PROBE=YES\n'
+printf 'V5_RUNBOOK_REFERENCES_ACCEPTED_V3_POSTGRES_PROOF=YES\n'
+printf 'README_POSTGRES_PROBE_OWNER=V3\n'
+printf 'README_PGBOUNCER_PROBE_OWNER=V5\n'
+printf 'README_REDIS_PROBE_OWNER=V5\n'
+printf 'PLAN_V5_POSTGRES_RERUN=NO\n'
 printf 'VPS_DEPLOY_CONTRACT=PASS\n'
