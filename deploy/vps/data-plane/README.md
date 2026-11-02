@@ -95,19 +95,13 @@ File-backed Compose secrets use read-only host file mounts; Compose does not rem
 
 The PostgreSQL bootstrap password is supplied through `POSTGRES_PASSWORD_FILE`. It is used only for initial database bootstrap and must not become an application runtime credential. PgBouncer's generated config holds the PostgreSQL server password; the auth file holds client authentication verifiers. Redis ACL password placeholders are SHA-256 digests of separately generated passwords.
 
-## Probe authority
+## R4.4 one-shot data-plane proofs
 
-`probe-postgres.sh` is owned by V3. `bootstrap-postgres.sh` invokes it during `PHASE_4_PROBE` and requires exact `POSTGRES_PROBE=PASS` before setting `BOOTSTRAPPED`. `probe-postgres.sh` MUST NOT be rerun during V5. The PostgreSQL structural proof accepted during V3 remains prior evidence for V5.
+These host-side probes may run only after the accepted V3/V4 procedure has created and started the production data plane and a future V5 authority explicitly authorizes the proof. Repository merge does not authorize VPS execution. Both probes require root and the absolute R4.2 secret directory; each validates only its required raw password files and writes mode-0600 evidence there. The probes inspect and execute bounded clients against the already-running `eventsales-prod` services. They do not create, start, restart, or stop services.
 
-`probe-pgbouncer.sh` is owned by V5. It proves fresh PgBouncer/runtime database behavior. `probe-redis.sh` is owned by V5. It proves fresh Redis behavior. Run the PgBouncer proof first; run Redis only after PgBouncer passes.
+`agentops` remains unprivileged. Production root execution must use a separately reviewed narrow sudo/root wrapper that executes reviewed, root-owned immutable staged bytes. Never execute these privileged scripts directly from an `agentops`-writable Git checkout. The exact wrapper and installation invocation will be defined and reviewed before V5. R4.4 does not implement that wrapper.
 
-## V5 one-shot runtime data-plane proofs
-
-These two V5 runtime probes may run only after the accepted V3/V4 procedure has created and started the production data plane and a separate V5 authority explicitly authorizes the proof. Repository merge does not authorize VPS execution. Both V5 runtime probes require root and the absolute R4.2 secret directory; each validates only its required raw password files and writes mode-0600 evidence there. They inspect and execute bounded clients against the already-running `eventsales-prod` services. They do not create, start, restart, or stop services.
-
-`agentops` remains unprivileged. Production root execution must use a separately reviewed narrow sudo/root wrapper that executes reviewed, root-owned immutable staged bytes. Never execute these privileged scripts directly from an `agentops`-writable Git checkout. The V5 probe-execution wrapper remains a separate review and authorization step.
-
-Each V5 runtime probe is one-shot. A failed run preserves its evidence and must stop for review; failed PostgreSQL runtime-proof objects and Redis state remain in place. Do not blindly rerun a failed or successful proof, repair its state automatically, or perform automatic destructive cleanup. Do not use `--rm` helper containers for failure-sensitive proof. Successful evidence and proof artifacts remain until explicit acceptance and cleanup authority is granted. The PostgreSQL structural-proof table created during V3 remains part of later V5 acceptance evidence; V5 does not rerun its probe. Redis proof keys expire under their 60-second rate-limit and one-hour hot-state TTLs.
+Each probe is one-shot. A failed run preserves its evidence and must stop for review; failed PostgreSQL proof objects remain in place. Do not blindly rerun a failed or successful proof, repair its state automatically, or perform automatic destructive cleanup. Do not use `--rm` helper containers for failure-sensitive proof. Successful evidence and proof artifacts remain until explicit acceptance and cleanup authority is granted. The PostgreSQL proof table is retained for later V5 acceptance; Redis proof keys expire under their 60-second rate-limit and one-hour hot-state TTLs.
 
 ## Configuration-only validation
 
