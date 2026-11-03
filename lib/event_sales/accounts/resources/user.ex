@@ -78,14 +78,6 @@ defmodule EventSales.Accounts.Resources.User do
   end
 
   authentication do
-    session_identifier :unsafe
-
-    tokens do
-      enabled? true
-      token_resource false
-      signing_secret EventSales.Accounts.AuthenticationSigningSecret
-    end
-
     strategies do
       password :password do
         identity_field :email

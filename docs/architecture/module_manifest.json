@@ -8,7 +8,6 @@
     "lib/event_sales.ex",
     "lib/event_sales/accounts.ex",
     "lib/event_sales/accounts/auth_overrides.ex",
-    "lib/event_sales/accounts/authentication_signing_secret.ex",
     "lib/event_sales/accounts/pii_policy.ex",
     "lib/event_sales/accounts/policies.ex",
     "lib/event_sales/accounts/resources/event_access_grant.ex",
@@ -473,23 +472,6 @@
       "public_funs": [],
       "specs?": false,
       "uses": []
-    },
-    {
-      "docs_count": 0,
-      "moduledoc?": true,
-      "name": "EventSales.Accounts.AuthenticationSigningSecret",
-      "parse_error": null,
-      "path": "lib/event_sales/accounts/authentication_signing_secret.ex",
-      "public_funs": [
-        {
-          "arity": 4,
-          "name": "secret_for"
-        }
-      ],
-      "specs?": false,
-      "uses": [
-        "AshAuthentication.Secret"
-      ]
     },
     {
       "docs_count": 3,

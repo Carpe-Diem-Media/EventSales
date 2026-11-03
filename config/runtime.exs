@@ -187,8 +187,6 @@ if config_env() == :prod do
     ],
     secret_key_base: secret_key_base
 
-  config :event_sales, :ash_authentication_token_signing_secret, secret_key_base
-
   webhook_path_token =
     System.get_env("WEBHOOK_PATH_TOKEN") ||
       raise "environment variable WEBHOOK_PATH_TOKEN is missing."
