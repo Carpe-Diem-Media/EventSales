@@ -5,6 +5,7 @@ defmodule EventSales.Analytics.SourceWriterEventFenceConcurrencyTest do
   require Ash.Query
 
   alias EventSales.Analytics.EventSnapshotAffectedEvents
+  alias EventSales.Analytics.Aggregators.EventAggregator
   alias EventSales.Analytics.EventSnapshotRefreshFence
   alias EventSales.Analytics.Workers.RefreshSnapshotWorker
 
@@ -29,6 +30,7 @@ defmodule EventSales.Analytics.SourceWriterEventFenceConcurrencyTest do
   alias EventSales.Sales
   alias EventSales.Sales.OrderAttributionCorrection
   alias EventSales.Sales.OrderUpserter
+  alias EventSales.Sales.RefundUpserter
   alias EventSales.Sales.Resources.{CouponSnapshot, Order, OrderItem, Refund, RefundLine}
 
   alias EventSales.TestSupport.{
@@ -71,6 +73,307 @@ defmodule EventSales.Analytics.SourceWriterEventFenceConcurrencyTest do
              UnboxedPostgres.with_connection(fn -> order_items!(order.id) end)
 
     assert event_id == fixture.event.id
+  end
+
+  test "a mapped value-only refund with nil quantity waits for the event refresh fence" do
+    fixture = create_mapped_fixture!() |> register_fixture_cleanup!()
+
+    {order, item} =
+      UnboxedPostgres.with_connection(fn ->
+        order = SalesHelpers.create_order_from_fixture!(:order_completed, fixture.source)
+
+        item =
+          SalesHelpers.create_order_item_from_line!(
+            order,
+            %{
+              "id" => System.unique_integer([:positive]),
+              "product_id" => 501,
+              "variation_id" => 601,
+              "name" => "Writer fence ticket",
+              "quantity" => 2,
+              "subtotal" => "80.00",
+              "total" => "80.00",
+              "discount_total" => "0.00"
+            },
+            %{
+              event_id: fixture.event.id,
+              ticket_type_id: fixture.ticket.id,
+              item_kind: :ticket,
+              mapping_status: :mapped,
+              line_total_tax: Decimal.new("0.00")
+            }
+          )
+
+        {order, item}
+      end)
+
+    refund_id = System.unique_integer([:positive])
+
+    normalized_refund = %{
+      woo_refund_id: refund_id,
+      header_amount: Decimal.new("50.00"),
+      reason: "value-only refund",
+      source_created_at: ~U[2026-05-01 10:00:00Z],
+      line_items: [
+        %{
+          woo_refund_line_item_id: System.unique_integer([:positive]),
+          woo_refunded_item_id: item.woo_line_item_id,
+          woo_product_id: 501,
+          woo_variation_id: 601,
+          refunded_quantity: nil,
+          refund_subtotal_amount: Decimal.new("45.00"),
+          refund_total_amount: Decimal.new("45.00"),
+          refund_total_tax: Decimal.new("5.00"),
+          binding_reason: nil,
+          validation_reason: nil
+        }
+      ],
+      shipping_refund_amount: nil,
+      shipping_refund_tax: nil,
+      fee_refund_amount: nil,
+      fee_refund_tax: nil,
+      unallocated_header_amount: Decimal.new("50.00")
+    }
+
+    parent = self()
+    holder = start_session_fence(parent, fixture.event.id)
+
+    writer =
+      Task.async(fn ->
+        UnboxedPostgres.with_connection(fn ->
+          backend_pid = EventSnapshotRefreshFence.connection_backend_pid()
+          send(parent, {:refund_writer_backend, backend_pid})
+
+          RefundUpserter.upsert_normalized_refund(
+            fixture.source.id,
+            order.woo_order_id,
+            normalized_refund,
+            snapshot_refresh_scheduler: fn _event_ids -> :ok end
+          )
+        end)
+      end)
+
+    try do
+      assert_receive {:refund_writer_backend, writer_backend}, 5_000
+
+      case Task.yield(writer, 1_000) do
+        nil ->
+          EventSnapshotRefreshTestSupport.wait_for_advisory_lock_wait!(writer_backend)
+          assert refund_count!(fixture.source.id, refund_id) == 0
+
+          send(holder.task.pid, :release_refresh_fence)
+          assert :ok = Task.await(holder.task, 15_000)
+          assert {:ok, %Refund{} = refund} = Task.await(writer, 15_000)
+
+          assert refund_count!(fixture.source.id, refund_id) == 1
+          assert [%RefundLine{refunded_quantity: nil}] = refund_lines!(refund.id)
+
+          assert {:ok, summaries} =
+                   UnboxedPostgres.with_connection(fn ->
+                     EventAggregator.financial_summaries_for_event(fixture.event.id)
+                   end)
+
+          summary = Map.fetch!(summaries, order.currency)
+          assert Decimal.equal?(summary.refund_ticket_quantity, Decimal.new("0"))
+          assert Decimal.gt?(summary.refund_ticket_value, Decimal.new("0"))
+
+        {:ok, {:ok, %Refund{}}} ->
+          assert refund_count!(fixture.source.id, refund_id) == 1
+
+          flunk(
+            "RefundUpserter committed a snapshot-relevant refund while the event fence was held"
+          )
+
+        other ->
+          flunk(
+            "RefundUpserter finished unexpectedly while the event fence was held: #{inspect(other)}"
+          )
+      end
+    after
+      send(holder.task.pid, :release_refresh_fence)
+      Task.yield(holder.task, 1_000) || Task.shutdown(holder.task)
+      Task.yield(writer, 1_000) || Task.shutdown(writer)
+    end
+  end
+
+  test "a refund without an event candidate does not wait on an unrelated event fence" do
+    fixture = create_mapped_fixture!() |> register_fixture_cleanup!()
+    parent = self()
+    holder = start_session_fence(parent, fixture.event.id)
+    refund_id = System.unique_integer([:positive])
+    line_id = System.unique_integer([:positive])
+
+    normalized_refund = %{
+      woo_refund_id: refund_id,
+      header_amount: Decimal.new("50.00"),
+      reason: "unattributed refund",
+      source_created_at: ~U[2026-05-01 10:00:00Z],
+      line_items: [
+        %{
+          woo_refund_line_item_id: line_id,
+          woo_refunded_item_id: 71_001,
+          woo_product_id: 501,
+          woo_variation_id: 601,
+          refunded_quantity: nil,
+          refund_subtotal_amount: Decimal.new("45.00"),
+          refund_total_amount: Decimal.new("45.00"),
+          refund_total_tax: Decimal.new("5.00"),
+          binding_reason: nil,
+          validation_reason: nil
+        }
+      ],
+      shipping_refund_amount: nil,
+      shipping_refund_tax: nil,
+      fee_refund_amount: nil,
+      fee_refund_tax: nil,
+      unallocated_header_amount: Decimal.new("50.00")
+    }
+
+    writer =
+      Task.async(fn ->
+        UnboxedPostgres.with_connection(fn ->
+          RefundUpserter.upsert_normalized_refund(
+            fixture.source.id,
+            System.unique_integer([:positive]),
+            normalized_refund,
+            snapshot_refresh_scheduler: fn event_ids ->
+              send(parent, {:unattributed_refund_scheduled, event_ids})
+              :ok
+            end
+          )
+        end)
+      end)
+
+    try do
+      assert {:ok, {:ok, %Refund{} = refund}} = Task.yield(writer, 1_000)
+      assert refund.order_id == nil
+      assert refund_count!(fixture.source.id, refund_id) == 1
+
+      assert [%RefundLine{order_item_id: nil, binding_reason: "parent_order_not_found"}] =
+               refund_lines!(refund.id)
+
+      refute_receive {:unattributed_refund_scheduled, _event_ids}
+    after
+      send(holder.task.pid, :release_refresh_fence)
+      Task.yield(holder.task, 15_000) || Task.shutdown(holder.task)
+
+      if Process.alive?(writer.pid) do
+        Task.yield(writer, 1_000) || Task.shutdown(writer)
+      end
+    end
+  end
+
+  test "a period invalidation failure rolls back a refund and releases its event xact fence" do
+    fixture = create_mapped_fixture!() |> register_fixture_cleanup!()
+
+    {order, item} =
+      UnboxedPostgres.with_connection(fn ->
+        order = SalesHelpers.create_order_from_fixture!(:order_completed, fixture.source)
+
+        item =
+          SalesHelpers.create_order_item_from_line!(
+            order,
+            %{
+              "id" => System.unique_integer([:positive]),
+              "product_id" => 501,
+              "variation_id" => 601,
+              "name" => "Writer fence rollback ticket",
+              "quantity" => 2,
+              "subtotal" => "80.00",
+              "total" => "80.00",
+              "discount_total" => "0.00"
+            },
+            %{
+              event_id: fixture.event.id,
+              ticket_type_id: fixture.ticket.id,
+              item_kind: :ticket,
+              mapping_status: :mapped,
+              line_total_tax: Decimal.new("0.00")
+            }
+          )
+
+        {order, item}
+      end)
+
+    refund_id = System.unique_integer([:positive])
+    line_id = System.unique_integer([:positive])
+    parent = self()
+
+    normalized_refund = %{
+      woo_refund_id: refund_id,
+      header_amount: Decimal.new("50.00"),
+      reason: "rollback after event fence",
+      source_created_at: ~U[2026-05-01 10:00:00Z],
+      line_items: [
+        %{
+          woo_refund_line_item_id: line_id,
+          woo_refunded_item_id: item.woo_line_item_id,
+          woo_product_id: 501,
+          woo_variation_id: 601,
+          refunded_quantity: nil,
+          refund_subtotal_amount: Decimal.new("45.00"),
+          refund_total_amount: Decimal.new("45.00"),
+          refund_total_tax: Decimal.new("5.00"),
+          binding_reason: nil,
+          validation_reason: nil
+        }
+      ],
+      shipping_refund_amount: nil,
+      shipping_refund_tax: nil,
+      fee_refund_amount: nil,
+      fee_refund_tax: nil,
+      unallocated_header_amount: Decimal.new("50.00")
+    }
+
+    writer =
+      Task.async(fn ->
+        UnboxedPostgres.with_connection(fn ->
+          RefundUpserter.upsert_normalized_refund(
+            fixture.source.id,
+            order.woo_order_id,
+            normalized_refund,
+            period_projection_invalidator: fn _before_snapshot, _after_snapshot ->
+              backend_pid = EventSnapshotRefreshFence.connection_backend_pid()
+              send(parent, {:refund_invalidator_reached, backend_pid})
+
+              receive do
+                :fail_period_invalidation -> {:error, :injected_period_projection_failure}
+              after
+                15_000 -> {:error, :period_invalidation_test_timeout}
+              end
+            end,
+            snapshot_refresh_scheduler: fn _event_ids ->
+              send(parent, :snapshot_scheduler_unexpectedly_called)
+              :ok
+            end
+          )
+        end)
+      end)
+
+    assert_receive {:refund_invalidator_reached, writer_backend}, 5_000
+
+    writer_result =
+      try do
+        assert event_xact_lock_count!(writer_backend, fixture.event.id) == 1
+        assert refund_count!(fixture.source.id, refund_id) == 0
+        assert refund_line_count!(line_id) == 0
+        assert period_snapshot_count!(fixture.event.id) == 0
+
+        send(writer.pid, :fail_period_invalidation)
+        Task.await(writer, 15_000)
+      after
+        if Process.alive?(writer.pid) do
+          send(writer.pid, :fail_period_invalidation)
+          Task.yield(writer, 15_000) || Task.shutdown(writer)
+        end
+      end
+
+    assert {:error, :injected_period_projection_failure} = writer_result
+    refute_receive :snapshot_scheduler_unexpectedly_called
+    assert refund_count!(fixture.source.id, refund_id) == 0
+    assert refund_line_count!(line_id) == 0
+    assert period_snapshot_count!(fixture.event.id) == 0
+    assert event_xact_lock_count!(writer_backend, fixture.event.id) == 0
   end
 
   test "a status-only mutation of a non-recognized mapped order waits for the event fence" do
@@ -919,6 +1222,73 @@ defmodule EventSales.Analytics.SourceWriterEventFenceConcurrencyTest do
           select: count(order.id)
         )
       )
+    end)
+  end
+
+  defp refund_count!(source_id, woo_refund_id) do
+    UnboxedPostgres.with_connection(fn ->
+      Repo.one!(
+        from(refund in Refund,
+          where:
+            refund.source_system_id == ^source_id and
+              refund.woo_refund_id == ^woo_refund_id,
+          select: count(refund.id)
+        )
+      )
+    end)
+  end
+
+  defp refund_line_count!(woo_refund_line_item_id) do
+    UnboxedPostgres.with_connection(fn ->
+      Repo.one!(
+        from(line in RefundLine,
+          where: line.woo_refund_line_item_id == ^woo_refund_line_item_id,
+          select: count(line.id)
+        )
+      )
+    end)
+  end
+
+  defp period_snapshot_count!(event_id) do
+    UnboxedPostgres.with_connection(fn ->
+      Repo.one!(
+        from(snapshot in EventPeriodAggregateSnapshot,
+          where: snapshot.event_id == ^event_id,
+          select: count(snapshot.event_id)
+        )
+      )
+    end)
+  end
+
+  defp event_xact_lock_count!(backend_pid, event_id) do
+    assert {:ok, lock_key} = EventSnapshotRefreshFence.lock_key(event_id)
+
+    UnboxedPostgres.with_connection(fn ->
+      %Postgrex.Result{rows: [[count]]} =
+        Repo.query!(
+          """
+          SELECT count(*)
+          FROM pg_locks
+          WHERE locktype = 'advisory'
+            AND mode = 'ExclusiveLock'
+            AND granted
+            AND pid = $1
+            AND classid::bigint = (($2::bigint >> 32) & 4294967295)
+            AND objid::bigint = ($2::bigint & 4294967295)
+            AND objsubid = 1
+          """,
+          [backend_pid, lock_key]
+        )
+
+      count
+    end)
+  end
+
+  defp refund_lines!(refund_id) do
+    UnboxedPostgres.with_connection(fn ->
+      RefundLine
+      |> Ash.Query.filter(refund_id == ^refund_id)
+      |> Ash.read!(domain: Sales)
     end)
   end
 

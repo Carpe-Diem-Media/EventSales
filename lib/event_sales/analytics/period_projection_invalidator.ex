@@ -145,7 +145,7 @@ defmodule EventSales.Analytics.PeriodProjectionInvalidator do
          order,
          items_by_id
        )
-       when is_integer(quantity) and quantity >= 0 do
+       when is_nil(quantity) or (is_integer(quantity) and quantity >= 0) do
     item = Map.get(items_by_id, order_item_id)
 
     with {:ok, id} <- canonical_uuid(id),
@@ -324,7 +324,8 @@ defmodule EventSales.Analytics.PeriodProjectionInvalidator do
          parent,
          parent_items_by_id
        )
-       when is_integer(quantity) and is_struct(amount, Decimal) and is_struct(tax, Decimal) do
+       when (is_nil(quantity) or (is_integer(quantity) and quantity >= 0)) and
+              is_struct(amount, Decimal) and is_struct(tax, Decimal) do
     parent_item = Map.get(parent_items_by_id, order_item_id)
 
     with {:ok, id} <- canonical_uuid(id),

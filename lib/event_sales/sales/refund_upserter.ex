@@ -10,6 +10,7 @@ defmodule EventSales.Sales.RefundUpserter do
   require Ash.Query
   import Ecto.Query
 
+  alias EventSales.Analytics.EventSnapshotRefreshFence
   alias EventSales.Analytics.PeriodProjectionInvalidator
   alias EventSales.Analytics.Workers.RefreshSnapshotWorker
   alias EventSales.Ingestion.HistoricalRefundCoverageInvalidator
@@ -1032,32 +1033,34 @@ defmodule EventSales.Sales.RefundUpserter do
          opts,
          refresh_snapshot?
        ) do
-    result =
-      :erlang.apply(
-        HistoricalRefundCoverageInvalidator,
-        :invalidate_refund_change,
-        [before_snapshot, after_snapshot, candidate_event_ids]
-      )
+    with :ok <- EventSnapshotRefreshFence.lock_events_in_transaction(candidate_event_ids) do
+      result =
+        :erlang.apply(
+          HistoricalRefundCoverageInvalidator,
+          :invalidate_refund_change,
+          [before_snapshot, after_snapshot, candidate_event_ids]
+        )
 
-    case result do
-      {:ok, _result} ->
-        with :ok <- invalidate_period_projection(before_snapshot, after_snapshot, opts),
-             :ok <-
-               enqueue_refund_snapshot_refresh(
-                 before_snapshot,
-                 after_snapshot,
-                 candidate_event_ids,
-                 opts,
-                 refresh_snapshot?
-               ) do
-          {:ok, refund}
-        end
+      case result do
+        {:ok, _result} ->
+          with :ok <- invalidate_period_projection(before_snapshot, after_snapshot, opts),
+               :ok <-
+                 enqueue_refund_snapshot_refresh(
+                   before_snapshot,
+                   after_snapshot,
+                   candidate_event_ids,
+                   opts,
+                   refresh_snapshot?
+                 ) do
+            {:ok, refund}
+          end
 
-      {:error, reason} ->
-        {:error, reason}
+        {:error, reason} ->
+          {:error, reason}
 
-      _other ->
-        {:error, @invalid_refund_coverage_invalidator_result}
+        _other ->
+          {:error, @invalid_refund_coverage_invalidator_result}
+      end
     end
   end
 
