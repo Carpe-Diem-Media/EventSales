@@ -164,7 +164,12 @@ defmodule Mix.Tasks.Eventsales.Admin.BootstrapTest do
   defp authenticate(email, password) do
     strategy = AshAuthentication.Info.strategy!(User, :password)
 
-    case AshAuthentication.Strategy.action(strategy, :sign_in, %{email: email, password: password}) do
+    case AshAuthentication.Strategy.action(
+           strategy,
+           :sign_in,
+           %{email: email, password: password},
+           []
+         ) do
       {:ok, %User{}} -> true
       _ -> false
     end

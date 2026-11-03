@@ -54,7 +54,8 @@ defmodule EventSales.MixProject do
     [
       {:ash, ">= 3.37.1 and < 4.0.0"},
       {:ash_postgres, ">= 2.15.2 and < 3.0.0"},
-      {:ash_authentication, "~> 4.14"},
+      {:ash_authentication,
+       github: "team-alembic/ash_authentication", ref: "12d985f1d58a1319dc34de5255fe4e2908b0f664"},
       {:ash_admin, "~> 1.1"},
       {:ash_state_machine, "~> 0.2.13"},
       {:ash_paper_trail, "~> 0.7.0"},
@@ -62,7 +63,7 @@ defmodule EventSales.MixProject do
       {:phoenix_ecto, "~> 4.5"},
       {:ecto_sql, "~> 3.13"},
       {:postgrex, ">= 0.0.0"},
-      {:phoenix_html, "~> 4.1"},
+      {:phoenix_html, "~> 4.4"},
       {:mishka_chelekom, "~> 0.0.8", only: [:dev], runtime: false},
       {:tailwind, "~> 0.4.1", runtime: Mix.env() == :dev},
       {:esbuild, "~> 0.9", runtime: Mix.env() == :dev},

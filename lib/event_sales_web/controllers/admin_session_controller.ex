@@ -50,10 +50,15 @@ defmodule EventSalesWeb.AdminSessionController do
     strategy = AshAuthentication.Info.strategy!(User, :password)
 
     with {:ok, %User{active: true} = user} <-
-           AshAuthentication.Strategy.action(strategy, :sign_in, %{
-             email: email,
-             password: password
-           }),
+           AshAuthentication.Strategy.action(
+             strategy,
+             :sign_in,
+             %{
+               email: email,
+               password: password
+             },
+             []
+           ),
          true <- Policies.global_admin?(user) do
       {:ok, user}
     else
