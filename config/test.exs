@@ -48,6 +48,10 @@ config :event_sales, EventSalesWeb.Endpoint,
   secret_key_base: "UK6gckLT7AiM/VwG9t4M3p4GHD8+EHC9f8pY1h/MwQWXTWm471spFxMc2+evtDDN",
   server: false
 
+config :event_sales,
+       :ash_authentication_token_signing_secret,
+       "UK6gckLT7AiM/VwG9t4M3p4GHD8+EHC9f8pY1h/MwQWXTWm471spFxMc2+evtDDN"
+
 config :event_sales, :start_repo, true
 config :event_sales, :start_database_readiness, false
 

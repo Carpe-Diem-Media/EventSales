@@ -18,10 +18,15 @@ defmodule EventSales.Accounts.AuthenticationRolesEventAccessTest do
     strategy = AshAuthentication.Info.strategy!(User, :password)
 
     assert {:ok, signed_in} =
-             AshAuthentication.Strategy.action(strategy, :sign_in, %{
-               email: "admin-auth@example.com",
-               password: "admin-pass-123"
-             })
+             AshAuthentication.Strategy.action(
+               strategy,
+               :sign_in,
+               %{
+                 email: "admin-auth@example.com",
+                 password: "admin-pass-123"
+               },
+               []
+             )
 
     assert signed_in.id == user.id
     assert Policies.global_admin?(signed_in)

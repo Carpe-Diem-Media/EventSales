@@ -35,6 +35,10 @@ config :event_sales, EventSalesWeb.Endpoint,
     esbuild: {Esbuild, :install_and_run, [:event_sales, ~w(--watch)]}
   ]
 
+config :event_sales,
+       :ash_authentication_token_signing_secret,
+       "MkekSEyvdZgTCUyyH3zVeq4Xyf+5pd8gIu99N6nCifMQuE7a10F18zW8sp7ieEW+"
+
 # ## SSL Support
 #
 # In order to use HTTPS in development, a self-signed

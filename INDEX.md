@@ -8,7 +8,7 @@ Project root: `.`
 
 ## File Count
 
-438
+439
 
 ## Files
 
@@ -20,6 +20,7 @@ Project root: `.`
 - `lib/event_sales.ex`
 - `lib/event_sales/accounts.ex`
 - `lib/event_sales/accounts/auth_overrides.ex`
+- `lib/event_sales/accounts/authentication_signing_secret.ex`
 - `lib/event_sales/accounts/pii_policy.ex`
 - `lib/event_sales/accounts/policies.ex`
 - `lib/event_sales/accounts/resources/event_access_grant.ex`
@@ -471,6 +472,12 @@ Project root: `.`
   - docs_count: 0
   - public_funs: _none_
   - uses: _none_
+- `EventSales.Accounts.AuthenticationSigningSecret` - `lib/event_sales/accounts/authentication_signing_secret.ex`
+  - moduledoc?: true
+  - specs?: false
+  - docs_count: 0
+  - public_funs: `secret_for/4`
+  - uses: `AshAuthentication.Secret`
 - `EventSales.Accounts.PiiPolicy` - `lib/event_sales/accounts/pii_policy.ex`
   - moduledoc?: true
   - specs?: true
