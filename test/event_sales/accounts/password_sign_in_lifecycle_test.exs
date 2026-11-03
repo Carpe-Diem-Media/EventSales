@@ -14,10 +14,15 @@ defmodule EventSales.Accounts.PasswordSignInLifecycleTest do
     strategy = AshAuthentication.Info.strategy!(User, :password)
 
     assert {:ok, signed_in} =
-             AshAuthentication.Strategy.action(strategy, :sign_in, %{
-               email: "lifecycle@example.com",
-               password: @password
-             }, [])
+             AshAuthentication.Strategy.action(
+               strategy,
+               :sign_in,
+               %{
+                 email: "lifecycle@example.com",
+                 password: @password
+               },
+               []
+             )
 
     refute Map.has_key?(signed_in.__metadata__ || %{}, :token)
     assert signed_in.__metadata__[:authentication_strategies] == [:password]
