@@ -79,6 +79,16 @@ grep -Fqx "PROBE_SCRIPT=\"\$SCRIPT_DIR/probe-postgres.sh\"" "$POSTGRES_BOOTSTRAP
 grep -Fq "if EVENTSALES_SECRET_DIR=\"\$secret_dir\" \"\$PROBE_SCRIPT\" >\"\$probe_output_file\" 2>&1; then" "$POSTGRES_BOOTSTRAP" || fail V3_POSTGRES_PROBE_INVOKED
 grep -Fq "if ((probe_status != 0)) || ! grep -qx 'POSTGRES_PROBE=PASS' \"\$probe_output_file\"; then" "$POSTGRES_BOOTSTRAP" || fail V3_POSTGRES_PROBE_PASS_REQUIRED
 
+v3_runbook_section=$(awk '
+  /^### B3 \/ V3:/ { in_v3 = 1; next }
+  in_v3 && /^### B4 \/ V4:/ { exit }
+  in_v3 { print }
+' "$VPS_PRODUCTION_RUNBOOK")
+[[ -n "$v3_runbook_section" ]] || fail V3_RUNBOOK_SECTION
+grep -Fq "Before \`bootstrap-postgres.sh\` is invoked, that authorization MUST include its embedded \`probe-postgres.sh\` structural proof." <<<"$v3_runbook_section" || fail V3_RUNBOOK_AUTHORITY_BEFORE_BOOTSTRAP
+grep -Fq "The embedded probe grant, issued before bootstrap invocation, is logically consumed when \`PHASE_4_PROBE\` invokes \`probe-postgres.sh\`." <<<"$v3_runbook_section" || fail V3_RUNBOOK_PROBE_CONSUMPTION
+grep -Fq "require its exact \`POSTGRES_PROBE=PASS\` output before bootstrap may report \`POSTGRES_BOOTSTRAP_STATE=BOOTSTRAPPED\`." <<<"$v3_runbook_section" || fail V3_RUNBOOK_PROBE_PASS_REQUIRED
+
 v5_runbook_section=$(awk '
   /^### C \/ V5: prove and accept the data plane$/ { in_v5 = 1; next }
   in_v5 && /^### D \/ V6:/ { exit }
@@ -90,8 +100,18 @@ grep -Fq "\`probe-postgres.sh\` MUST NOT be rerun in V5." <<<"$v5_runbook_sectio
 if grep -Fq "Use \`probe-postgres.sh\`, \`probe-pgbouncer.sh\`, and \`probe-redis.sh\`" <<<"$v5_runbook_section"; then
   fail V5_RUNBOOK_POSTGRES_RERUN
 fi
-grep -Fq "Execute only \`probe-pgbouncer.sh\` and \`probe-redis.sh\`." <<<"$v5_runbook_section" || fail V5_RUNBOOK_RUNTIME_PROBES
+grep -Fq "Run a fresh \`probe-pgbouncer.sh\` followed by a fresh \`probe-redis.sh\`, in that order; these are the only probes run during V5." <<<"$v5_runbook_section" || fail V5_RUNBOOK_RUNTIME_PROBES
 grep -Fq "V5 authority is consumed immediately before the first \`probe-pgbouncer.sh\` invocation." <<<"$v5_runbook_section" || fail V5_RUNBOOK_AUTHORITY_CONSUMPTION
+
+plan_v3_section=$(awk '
+  /^## Gate V3/ { in_v3 = 1; next }
+  in_v3 && /^## Gate V4/ { exit }
+  in_v3 { print }
+' "$PRODUCTION_PLAN")
+[[ -n "$plan_v3_section" ]] || fail PLAN_V3_SECTION
+grep -Fq "Before \`bootstrap-postgres.sh\` is invoked, the explicit V3 authority must include its embedded \`probe-postgres.sh\` structural proof." <<<"$plan_v3_section" || fail PLAN_V3_AUTHORITY_BEFORE_BOOTSTRAP
+grep -Fq "That probe authority is logically consumed when \`PHASE_4_PROBE\` invokes \`probe-postgres.sh\`." <<<"$plan_v3_section" || fail PLAN_V3_PROBE_CONSUMPTION
+grep -Fq "Bootstrap requires exact \`POSTGRES_PROBE=PASS\` before it can report \`POSTGRES_BOOTSTRAP_STATE=BOOTSTRAPPED\`." <<<"$plan_v3_section" || fail PLAN_V3_PROBE_PASS_REQUIRED
 
 plan_v5_section=$(awk '
   /^## Gate V5/ { in_v5 = 1; next }
@@ -102,7 +122,8 @@ plan_v5_section=$(awk '
 grep -Fq 'Reuse the accepted V3 PostgreSQL structural-proof result.' <<<"$plan_v5_section" || fail PLAN_V5_POSTGRES_RERUN
 grep -Fq "Do not rerun \`probe-postgres.sh\` in V5." <<<"$plan_v5_section" || fail PLAN_V5_POSTGRES_RERUN
 [[ $(grep -Fc 'probe-postgres.sh' <<<"$plan_v5_section") -eq 1 ]] || fail PLAN_V5_POSTGRES_RERUN
-grep -Fq 'Run the PgBouncer and Redis V5 proofs once, in that order.' <<<"$plan_v5_section" || fail PLAN_V5_RUNTIME_PROOFS
+grep -Fq "Run a fresh \`probe-pgbouncer.sh\` followed by a fresh \`probe-redis.sh\`, in that order." <<<"$plan_v5_section" || fail PLAN_V5_RUNTIME_PROOFS
+grep -Fq "V5 authority is consumed immediately before the first \`probe-pgbouncer.sh\` invocation." <<<"$plan_v5_section" || fail PLAN_V5_AUTHORITY_CONSUMPTION
 
 [[ -x "$RECOVERY_WRAPPER" && ! -L "$RECOVERY_WRAPPER" ]] || fail RECOVERY_WRAPPER_TYPE
 bash -n "$RECOVERY_WRAPPER" || fail RECOVERY_WRAPPER_SYNTAX
@@ -749,9 +770,13 @@ python_check APP_INGRESS "$TMP_DIR/app-ingress.json"
 
 printf 'V3_BOOTSTRAP_INVOKES_POSTGRES_PROBE=YES\n'
 printf 'V3_BOOTSTRAP_REQUIRES_POSTGRES_PROBE_PASS=YES\n'
+printf 'V3_RUNBOOK_AUTHORIZES_EMBEDDED_PROBE_BEFORE_BOOTSTRAP=YES\n'
+printf 'V3_RUNBOOK_PROBE_AUTHORITY_CONSUMED_IN_PHASE_4=YES\n'
 printf 'V5_RUNBOOK_EXECUTES_POSTGRES_PROBE=NO\n'
 printf 'V5_RUNBOOK_EXECUTES_PGBOUNCER_PROBE=YES\n'
 printf 'V5_RUNBOOK_EXECUTES_REDIS_PROBE=YES\n'
 printf 'V5_RUNBOOK_REFERENCES_ACCEPTED_V3_POSTGRES_PROOF=YES\n'
+printf 'V5_RUNBOOK_PROBE_ORDER=PGBOUNCER_THEN_REDIS\n'
+printf 'V5_AUTHORITY_CONSUMED_BEFORE_PGBOUNCER=YES\n'
 printf 'PLAN_V5_POSTGRES_RERUN=NO\n'
 printf 'VPS_DEPLOY_CONTRACT=PASS\n'
