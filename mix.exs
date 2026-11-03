@@ -54,7 +54,8 @@ defmodule EventSales.MixProject do
     [
       {:ash, ">= 3.37.1 and < 4.0.0"},
       {:ash_postgres, ">= 2.15.2 and < 3.0.0"},
-      {:ash_authentication, "~> 5.0.0-rc.16"},
+      {:ash_authentication,
+       github: "team-alembic/ash_authentication", ref: "12d985f1d58a1319dc34de5255fe4e2908b0f664"},
       {:ash_admin, "~> 1.1"},
       {:ash_state_machine, "~> 0.2.13"},
       {:ash_paper_trail, "~> 0.7.0"},
