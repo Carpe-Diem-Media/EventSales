@@ -4,6 +4,7 @@ defmodule EventSales.Analytics.PeriodProjectionInvalidatorTest do
   require Ash.Query
 
   alias EventSales.Analytics
+  alias EventSales.Analytics.Aggregators.EventAggregator
   alias EventSales.Analytics.PeriodBucketRules
   alias EventSales.Analytics.PeriodProjectionInvalidator
   alias EventSales.Analytics.Resources.EventPeriodAggregateSnapshot
@@ -182,6 +183,100 @@ defmodule EventSales.Analytics.PeriodProjectionInvalidatorTest do
     assert Enum.all?(rows, &(&1.projection_state == :refresh_pending))
   end
 
+  test "canonical event aggregation includes positive value when refund quantity is nil" do
+    {_source, event, refund_snapshot} = refund_snapshot_fixture!(refunded_quantity: nil)
+
+    assert_canonical_value_only_refund!(event, refund_snapshot)
+  end
+
+  test "refund change invalidation persists buckets for a nil-quantity value-only refund" do
+    {_source, event, refund_snapshot} = refund_snapshot_fixture!(refunded_quantity: nil)
+    assert_canonical_value_only_refund!(event, refund_snapshot)
+
+    expected = period_bucket_keys!(refund_snapshot.refund_truth.source_created_at)
+
+    invalidate_refund!(nil, refund_snapshot)
+
+    actual = refresh_pending_bucket_keys!(event.id)
+
+    assert actual == expected,
+           "expected persisted refund period intents #{inspect(expected)}, got #{inspect(actual)}"
+  end
+
+  test "order recognition change invalidates a nil-quantity value-only refund bucket" do
+    {_source, event, refund_snapshot, recognized_order_snapshot} =
+      refund_snapshot_fixture!(refunded_quantity: nil, include_order_snapshot: true)
+
+    assert_canonical_value_only_refund!(event, refund_snapshot)
+
+    unrecognized_order_snapshot =
+      recognized_order_snapshot
+      |> put_in([:header, :status], :pending)
+      |> put_in([:header, :completed_at], nil)
+
+    assert unrecognized_order_snapshot.header.status == :pending
+    assert unrecognized_order_snapshot.header.completed_at == nil
+    assert recognized_order_snapshot.header.status == :completed
+    assert %DateTime{} = recognized_order_snapshot.header.completed_at
+
+    refund_bucket_keys =
+      period_bucket_keys!(refund_snapshot.refund_truth.source_created_at)
+
+    sale_effective_at =
+      recognized_order_snapshot.header.paid_at || recognized_order_snapshot.header.completed_at
+
+    sale_bucket_keys = period_bucket_keys!(sale_effective_at)
+
+    assert MapSet.disjoint?(MapSet.new(refund_bucket_keys), MapSet.new(sale_bucket_keys))
+
+    invalidate_order!(unrecognized_order_snapshot, recognized_order_snapshot)
+
+    persisted_bucket_keys = refresh_pending_bucket_keys!(event.id)
+    actual_refund_bucket_keys = Enum.filter(persisted_bucket_keys, &(&1 in refund_bucket_keys))
+
+    assert actual_refund_bucket_keys == refund_bucket_keys,
+           "expected value-only refund intents #{inspect(refund_bucket_keys)}, " <>
+             "got #{inspect(actual_refund_bucket_keys)}; all persisted intents: " <>
+             inspect(persisted_bucket_keys)
+  end
+
+  test "malformed refund quantity types remain excluded from refund period contributions" do
+    {_source, event, refund_snapshot, recognized_order_snapshot} =
+      refund_snapshot_fixture!(refunded_quantity: 1, include_order_snapshot: true)
+
+    malformed_refund_snapshot =
+      update_in(refund_snapshot, [:refund_line_truth, Access.at(0)], fn line ->
+        Map.put(line, :refunded_quantity, "1")
+      end)
+
+    invalidate_refund!(nil, malformed_refund_snapshot)
+    assert snapshots_for_event(event.id) == []
+
+    unrecognized_order_snapshot =
+      recognized_order_snapshot
+      |> put_in([:header, :status], :pending)
+      |> put_in([:header, :completed_at], nil)
+
+    malformed_order_snapshot =
+      update_in(
+        recognized_order_snapshot,
+        [:refunds, Access.at(0), :lines, Access.at(0)],
+        &Map.put(&1, :refunded_quantity, "1")
+      )
+
+    invalidate_order!(unrecognized_order_snapshot, malformed_order_snapshot)
+
+    sale_effective_at =
+      recognized_order_snapshot.header.paid_at || recognized_order_snapshot.header.completed_at
+
+    sale_bucket_keys = period_bucket_keys!(sale_effective_at)
+    refund_bucket_keys = period_bucket_keys!(refund_snapshot.refund_truth.source_created_at)
+    persisted_bucket_keys = refresh_pending_bucket_keys!(event.id)
+
+    assert MapSet.disjoint?(MapSet.new(sale_bucket_keys), MapSet.new(refund_bucket_keys))
+    assert persisted_bucket_keys == sale_bucket_keys
+  end
+
   test "refund effective-time correction and event correction invalidate before and after" do
     {source, event_a, refund_snapshot} = refund_snapshot_fixture!()
     event_b = SalesHelpers.create_event!(source, %{name: "Refund correction event"})
@@ -334,6 +429,59 @@ defmodule EventSales.Analytics.PeriodProjectionInvalidatorTest do
     |> Ash.Query.filter(event_id == ^event_id)
     |> Ash.Query.sort(bucket_kind: :asc)
     |> Ash.read!(domain: Analytics)
+  end
+
+  defp assert_canonical_value_only_refund!(event, snapshot) do
+    event_id = event.id
+    assert {:ok, ^event_id} = Ecto.UUID.cast(event_id)
+
+    %{
+      refund_truth: refund,
+      refund_line_truth: [line],
+      parent_order_evidence: parent,
+      parent_order_item_evidence: [parent_item]
+    } = snapshot
+
+    assert refund.source_state == :active
+    assert refund.detail_status == :complete
+    assert %DateTime{} = refund.source_created_at
+    assert refund.currency == parent.currency
+    assert parent.status == :completed
+    assert %DateTime{} = parent.completed_at
+    assert line.refunded_quantity == nil
+    assert is_integer(line.woo_refund_line_item_id) and line.woo_refund_line_item_id > 0
+    assert %Decimal{} = line.refund_total_amount
+    assert Decimal.compare(line.refund_total_amount, Decimal.new("0")) == :gt
+    assert %Decimal{} = line.refund_total_tax
+    assert line.binding_reason == nil
+    assert line.validation_reason == nil
+    assert {:ok, _line_id} = Ecto.UUID.cast(line.id)
+    assert parent_item.event_id == event.id
+    assert parent_item.item_kind == :ticket
+    assert parent_item.mapping_status == :mapped
+    assert parent_item.id == line.order_item_id
+    assert parent_item.woo_line_item_id == line.woo_refunded_item_id
+
+    assert {:ok, summaries} = EventAggregator.financial_summaries_for_event(event.id)
+    assert [summary] = Map.values(summaries)
+    assert Decimal.equal?(summary.refund_ticket_quantity, Decimal.new("0"))
+    assert Decimal.equal?(summary.refund_ticket_value, Decimal.new("12.00"))
+  end
+
+  defp period_bucket_keys!(instant) do
+    {:ok, buckets} = PeriodBucketRules.for_instant(instant)
+
+    buckets
+    |> Enum.map(&{&1.bucket_kind, &1.bucket_start_utc, &1.bucket_end_utc})
+    |> Enum.sort()
+  end
+
+  defp refresh_pending_bucket_keys!(event_id) do
+    event_id
+    |> snapshots_for_event()
+    |> Enum.filter(&(&1.projection_state == :refresh_pending))
+    |> Enum.map(&{&1.bucket_kind, &1.bucket_start_utc, &1.bucket_end_utc})
+    |> Enum.sort()
   end
 
   defp invalidate_order!(before_snapshot, after_snapshot) do

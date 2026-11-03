@@ -10,6 +10,7 @@ defmodule EventSales.Sales.RefundUpserter do
   require Ash.Query
   import Ecto.Query
 
+  alias EventSales.Analytics.EventSnapshotRefreshFence
   alias EventSales.Analytics.PeriodProjectionInvalidator
   alias EventSales.Analytics.Workers.RefreshSnapshotWorker
   alias EventSales.Ingestion.HistoricalRefundCoverageInvalidator
@@ -1029,6 +1030,26 @@ defmodule EventSales.Sales.RefundUpserter do
          after_snapshot,
          %Refund{} = refund,
          %{changed?: true, candidate_event_ids: candidate_event_ids},
+         opts,
+         refresh_snapshot?
+       ) do
+    with :ok <- EventSnapshotRefreshFence.lock_events_in_transaction(candidate_event_ids) do
+      finalize_refund_comparison_after_fence(
+        before_snapshot,
+        after_snapshot,
+        refund,
+        candidate_event_ids,
+        opts,
+        refresh_snapshot?
+      )
+    end
+  end
+
+  defp finalize_refund_comparison_after_fence(
+         before_snapshot,
+         after_snapshot,
+         %Refund{} = refund,
+         candidate_event_ids,
          opts,
          refresh_snapshot?
        ) do
