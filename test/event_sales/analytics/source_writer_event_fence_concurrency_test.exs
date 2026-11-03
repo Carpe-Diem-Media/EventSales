@@ -4,8 +4,8 @@ defmodule EventSales.Analytics.SourceWriterEventFenceConcurrencyTest do
   import Ecto.Query
   require Ash.Query
 
-  alias EventSales.Analytics.EventSnapshotAffectedEvents
   alias EventSales.Analytics.Aggregators.EventAggregator
+  alias EventSales.Analytics.EventSnapshotAffectedEvents
   alias EventSales.Analytics.EventSnapshotRefreshFence
   alias EventSales.Analytics.Workers.RefreshSnapshotWorker
 
