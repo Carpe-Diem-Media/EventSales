@@ -329,14 +329,20 @@ defmodule EventSales.Analytics.EventSnapshotRefreshFenceTest do
   end
 
   defp transaction_lock_available?(key) do
+    key
+    |> try_transaction_lock()
+    |> lock_acquired?()
+  end
+
+  defp try_transaction_lock(key) do
     Task.async(fn ->
       UnboxedPostgres.with_connection(fn ->
-        case Repo.query("SELECT pg_try_advisory_xact_lock($1::bigint)", [key]) do
-          {:ok, %{rows: [[true]]}} -> true
-          _ -> false
-        end
+        Repo.query("SELECT pg_try_advisory_xact_lock($1::bigint)", [key])
       end)
     end)
     |> Task.await(5_000)
   end
+
+  defp lock_acquired?({:ok, %{rows: [[true]]}}), do: true
+  defp lock_acquired?(_result), do: false
 end
