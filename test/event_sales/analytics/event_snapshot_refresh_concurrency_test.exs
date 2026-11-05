@@ -31,7 +31,7 @@ defmodule EventSales.Analytics.EventSnapshotRefreshConcurrencyTest do
   alias EventSales.TestSupport.{SalesHelpers, UnboxedPostgres}
   alias Oban.Job
 
-  test "concurrent refresh_event calls block on the PostgreSQL session fence" do
+  test "same event refreshes serialize inside the PostgreSQL transaction fence" do
     fixture = create_committed_fixture!()
     on_exit(fn -> cleanup_committed_fixture!(fixture) end)
 
@@ -41,10 +41,15 @@ defmodule EventSales.Analytics.EventSnapshotRefreshConcurrencyTest do
       Task.async(fn ->
         UnboxedPostgres.with_connection(fn ->
           EventSnapshotRefreshFence.with_serial_event_refresh(fixture.event_id, fn ->
-            send(parent, {:holder_backend, EventSnapshotRefreshFence.connection_backend_pid()})
+            send(parent, {
+              :holder_backend,
+              EventSnapshotRefreshFence.connection_backend_pid(),
+              Repo.in_transaction?(),
+              EventSnapshotRefreshTestSupport.transaction_isolation_level()
+            })
 
             receive do
-              :release_session_fence -> :ok
+              :commit_refresh_fence -> :ok
             after
               15_000 -> :timeout
             end
@@ -52,7 +57,7 @@ defmodule EventSales.Analytics.EventSnapshotRefreshConcurrencyTest do
         end)
       end)
 
-    assert_receive {:holder_backend, holder_backend}, 5_000
+    assert_receive {:holder_backend, holder_backend, true, "read committed"}, 5_000
 
     waiter =
       Task.async(fn ->
@@ -67,9 +72,18 @@ defmodule EventSales.Analytics.EventSnapshotRefreshConcurrencyTest do
     assert waiter_backend != holder_backend
 
     EventSnapshotRefreshTestSupport.wait_for_advisory_lock_wait!(waiter_backend)
+
+    assert {:ok, %{rows: [[true]]}} =
+             UnboxedPostgres.with_connection(fn ->
+               Repo.query(
+                 "SELECT xact_start IS NOT NULL FROM pg_stat_activity WHERE pid = $1",
+                 [waiter_backend]
+               )
+             end)
+
     refute_receive {:waiter_done, _}, 200
 
-    send(holder.pid, :release_session_fence)
+    send(holder.pid, :commit_refresh_fence)
 
     assert {:ok, snapshots} = Task.await(waiter, 15_000)
     assert length(snapshots) == 2
@@ -110,28 +124,30 @@ defmodule EventSales.Analytics.EventSnapshotRefreshConcurrencyTest do
     assert currencies == ["ZAR"]
   end
 
-  test "overlapping refresh_event uses source facts visible after acquiring the session fence" do
+  test "refresh reads source facts committed before it acquires the transaction fence" do
     fixture = create_committed_fixture!()
     on_exit(fn -> cleanup_committed_fixture!(fixture) end)
 
     parent = self()
 
-    holder =
+    writer =
       Task.async(fn ->
         UnboxedPostgres.with_connection(fn ->
-          EventSnapshotRefreshFence.with_serial_event_refresh(fixture.event_id, fn ->
-            send(parent, {:holder_backend, EventSnapshotRefreshFence.connection_backend_pid()})
+          Repo.transaction(fn ->
+            assert :ok = EventSnapshotRefreshFence.lock_events_in_transaction([fixture.event_id])
+            delete_items_for_order!(fixture.usd_order_id)
+            send(parent, {:writer_backend, EventSnapshotRefreshFence.connection_backend_pid()})
 
             receive do
-              :release_session_fence -> :ok
+              :commit_source_transaction -> :ok
             after
-              20_000 -> :timeout
+              20_000 -> Repo.rollback(:source_writer_timeout)
             end
           end)
         end)
       end)
 
-    assert_receive {:holder_backend, _holder_backend}, 5_000
+    assert_receive {:writer_backend, _writer_backend}, 5_000
 
     waiter =
       Task.async(fn ->
@@ -145,12 +161,17 @@ defmodule EventSales.Analytics.EventSnapshotRefreshConcurrencyTest do
     assert_receive {:waiter_backend, waiter_backend}, 5_000
     EventSnapshotRefreshTestSupport.wait_for_advisory_lock_wait!(waiter_backend)
 
-    UnboxedPostgres.with_connection(fn ->
-      delete_items_for_order!(fixture.usd_order_id)
-    end)
+    assert {:ok, %{rows: [[true]]}} =
+             UnboxedPostgres.with_connection(fn ->
+               Repo.query(
+                 "SELECT xact_start IS NOT NULL FROM pg_stat_activity WHERE pid = $1",
+                 [waiter_backend]
+               )
+             end)
 
-    send(holder.pid, :release_session_fence)
+    send(writer.pid, :commit_source_transaction)
 
+    assert {:ok, :ok} = Task.await(writer, 5_000)
     assert {:ok, [zar_snapshot]} = Task.await(waiter, 20_000)
     assert zar_snapshot.currency == "ZAR"
     assert zar_snapshot.gross_ticket_quantity == 1
@@ -183,7 +204,7 @@ defmodule EventSales.Analytics.EventSnapshotRefreshConcurrencyTest do
             send(parent, :holder_ready)
 
             receive do
-              :release_session_fence -> :ok
+              :release_refresh_fence -> :ok
             after
               20_000 -> :timeout
             end
@@ -222,7 +243,7 @@ defmodule EventSales.Analytics.EventSnapshotRefreshConcurrencyTest do
     EventSnapshotRefreshTestSupport.wait_for_advisory_lock_wait!(first_backend)
     EventSnapshotRefreshTestSupport.wait_for_advisory_lock_wait!(second_backend)
 
-    send(holder.pid, :release_session_fence)
+    send(holder.pid, :release_refresh_fence)
 
     assert {:ok, first_result} = Task.await(first_refresh, 20_000)
     assert {:ok, second_result} = Task.await(second_refresh, 20_000)
@@ -431,19 +452,14 @@ defmodule EventSales.Analytics.EventSnapshotRefreshConcurrencyTest do
       Task.async(fn ->
         UnboxedPostgres.with_connection(fn ->
           EventSnapshotRefreshFence.with_serial_event_refresh(fixture.event_id, fn ->
-            Repo.transaction(
-              fn ->
-                assert :ok = PeriodProjectionRefresh.refresh_pending_event(fixture.event_id)
-                send(parent, :period_worker_rebuilt_old_truth)
+            assert :ok = PeriodProjectionRefresh.refresh_pending_event(fixture.event_id)
+            send(parent, :period_worker_rebuilt_old_truth)
 
-                receive do
-                  :commit_period_worker -> :ok
-                after
-                  15_000 -> Repo.rollback(:period_worker_timeout)
-                end
-              end,
-              [timeout: 30_000] ++ EventSnapshotRefreshFence.coherent_transaction_opts()
-            )
+            receive do
+              :commit_period_worker -> :ok
+            after
+              15_000 -> Repo.rollback(:period_worker_timeout)
+            end
           end)
         end)
       end)
@@ -476,7 +492,7 @@ defmodule EventSales.Analytics.EventSnapshotRefreshConcurrencyTest do
 
     send(worker.pid, :commit_period_worker)
 
-    assert {:ok, :ok} = Task.await(worker, 10_000)
+    assert :ok = Task.await(worker, 10_000)
     assert {:ok, :ok} = Task.await(source, 10_000)
 
     stale_sale_bucket = sale_hour_bucket!(fixture)

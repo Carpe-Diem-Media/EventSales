@@ -46,7 +46,7 @@ defmodule EventSales.Analytics.EventSnapshotRefreshFenceTest do
     end)
   end
 
-  test "session fence blocks a second connection until the holder releases the lock" do
+  test "event refresh transaction fence blocks a second connection until commit" do
     event_id = Ecto.UUID.generate()
     parent = self()
 
@@ -56,10 +56,15 @@ defmodule EventSales.Analytics.EventSnapshotRefreshFenceTest do
           holder_backend = EventSnapshotRefreshFence.connection_backend_pid()
 
           EventSnapshotRefreshFence.with_serial_event_refresh(event_id, fn ->
-            send(parent, {:holder_ready, holder_backend})
+            send(parent, {
+              :holder_ready,
+              holder_backend,
+              Repo.in_transaction?(),
+              EventSnapshotRefreshTestSupport.transaction_isolation_level()
+            })
 
             receive do
-              :release_session_fence -> :ok
+              :commit_refresh_fence -> :ok
             after
               15_000 -> :timeout
             end
@@ -67,7 +72,7 @@ defmodule EventSales.Analytics.EventSnapshotRefreshFenceTest do
         end)
       end)
 
-    assert_receive {:holder_ready, holder_backend}, 5_000
+    assert_receive {:holder_ready, holder_backend, true, "read committed"}, 5_000
 
     waiter =
       Task.async(fn ->
@@ -88,7 +93,7 @@ defmodule EventSales.Analytics.EventSnapshotRefreshFenceTest do
     EventSnapshotRefreshTestSupport.wait_for_advisory_lock_wait!(waiter_backend)
     refute_receive :waiter_acquired, 200
 
-    send(holder.pid, :release_session_fence)
+    send(holder.pid, :commit_refresh_fence)
     assert_receive :waiter_acquired, 5_000
 
     assert :ok = Task.await(holder, 5_000)
@@ -107,7 +112,7 @@ defmodule EventSales.Analytics.EventSnapshotRefreshFenceTest do
     end)
   end
 
-  test "successful fenced callback releases the session lock" do
+  test "successful fenced callback releases its transaction lock" do
     event_id = Ecto.UUID.generate()
     assert {:ok, key} = EventSnapshotRefreshFence.lock_key(event_id)
 
@@ -115,11 +120,11 @@ defmodule EventSales.Analytics.EventSnapshotRefreshFenceTest do
       assert :ok =
                EventSnapshotRefreshFence.with_serial_event_refresh(event_id, fn -> :ok end)
 
-      assert session_lock_available?(key)
+      assert transaction_lock_available?(key)
     end)
   end
 
-  test "raised fenced callback still releases the session lock for another backend" do
+  test "raised fenced callback rolls back and releases its transaction lock" do
     event_id = Ecto.UUID.generate()
     assert {:ok, key} = EventSnapshotRefreshFence.lock_key(event_id)
 
@@ -129,7 +134,7 @@ defmodule EventSales.Analytics.EventSnapshotRefreshFenceTest do
                  raise "boom"
                end)
 
-      assert session_lock_available?(key)
+      assert transaction_lock_available?(key)
     end)
 
     parent = self()
@@ -152,7 +157,7 @@ defmodule EventSales.Analytics.EventSnapshotRefreshFenceTest do
     assert :ok = Task.await(releaser, 5_000)
   end
 
-  test "source transaction lock blocks a worker session fence until source commit" do
+  test "source transaction lock blocks a refresh fence until source commit" do
     event_id = Ecto.UUID.generate()
     parent = self()
 
@@ -198,7 +203,7 @@ defmodule EventSales.Analytics.EventSnapshotRefreshFenceTest do
     assert {_, :ok} = Task.await(worker, 5_000)
   end
 
-  test "worker session fence blocks a source transaction lock until worker release" do
+  test "refresh transaction fence blocks a source transaction lock until commit" do
     event_id = Ecto.UUID.generate()
     parent = self()
 
@@ -206,10 +211,10 @@ defmodule EventSales.Analytics.EventSnapshotRefreshFenceTest do
       Task.async(fn ->
         UnboxedPostgres.with_connection(fn ->
           EventSnapshotRefreshFence.with_serial_event_refresh(event_id, fn ->
-            send(parent, :worker_session_locked)
+            send(parent, :refresh_transaction_locked)
 
             receive do
-              :release_worker -> :ok
+              :commit_refresh -> :ok
             after
               15_000 -> :timeout
             end
@@ -217,7 +222,7 @@ defmodule EventSales.Analytics.EventSnapshotRefreshFenceTest do
         end)
       end)
 
-    assert_receive :worker_session_locked, 5_000
+    assert_receive :refresh_transaction_locked, 5_000
 
     source =
       Task.async(fn ->
@@ -232,20 +237,106 @@ defmodule EventSales.Analytics.EventSnapshotRefreshFenceTest do
 
     refute_receive :source_acquired_after_worker, 200
 
-    send(worker.pid, :release_worker)
+    send(worker.pid, :commit_refresh)
     assert_receive :source_acquired_after_worker, 5_000
     assert :ok = Task.await(worker, 5_000)
     assert {:ok, :ok} = Task.await(source, 5_000)
   end
 
-  defp session_lock_available?(key) do
-    case Repo.query("SELECT pg_try_advisory_lock($1::bigint)", [key]) do
-      {:ok, %{rows: [[true]]}} ->
-        Repo.query!("SELECT pg_advisory_unlock($1::bigint)", [key])
-        true
+  test "different event refresh fences do not block each other" do
+    parent = self()
+    held_event_id = Ecto.UUID.generate()
+    independent_event_id = Ecto.UUID.generate()
 
-      _ ->
-        false
-    end
+    holder =
+      Task.async(fn ->
+        UnboxedPostgres.with_connection(fn ->
+          EventSnapshotRefreshFence.with_serial_event_refresh(held_event_id, fn ->
+            send(parent, :first_event_fence_held)
+
+            receive do
+              :commit_first_event -> :ok
+            after
+              15_000 -> Repo.rollback(:first_event_timeout)
+            end
+          end)
+        end)
+      end)
+
+    assert_receive :first_event_fence_held, 5_000
+
+    independent =
+      Task.async(fn ->
+        UnboxedPostgres.with_connection(fn ->
+          EventSnapshotRefreshFence.with_serial_event_refresh(independent_event_id, fn ->
+            send(parent, :second_event_fence_acquired)
+            :ok
+          end)
+        end)
+      end)
+
+    assert_receive :second_event_fence_acquired, 5_000
+    assert :ok = Task.await(independent, 5_000)
+
+    send(holder.pid, :commit_first_event)
+    assert :ok = Task.await(holder, 5_000)
+  end
+
+  test "a timed out lock request returns an error and releases the transaction" do
+    event_id = Ecto.UUID.generate()
+    parent = self()
+
+    holder =
+      Task.async(fn ->
+        UnboxedPostgres.with_connection(fn ->
+          EventSnapshotRefreshFence.with_serial_event_refresh(event_id, fn ->
+            send(parent, :timeout_holder_ready)
+
+            receive do
+              :commit_timeout_holder -> :ok
+            after
+              15_000 -> Repo.rollback(:timeout_holder_expired)
+            end
+          end)
+        end)
+      end)
+
+    assert_receive :timeout_holder_ready, 5_000
+
+    waiter =
+      Task.async(fn ->
+        UnboxedPostgres.with_connection(fn ->
+          Repo.query!("SET lock_timeout = '100ms'")
+          backend_pid = EventSnapshotRefreshFence.connection_backend_pid()
+          send(parent, {:timeout_waiter_backend, backend_pid})
+
+          try do
+            EventSnapshotRefreshFence.with_serial_event_refresh(event_id, fn -> :ok end)
+          after
+            Repo.query!("RESET lock_timeout")
+          end
+        end)
+      end)
+
+    assert_receive {:timeout_waiter_backend, waiter_backend}, 5_000
+    EventSnapshotRefreshTestSupport.wait_for_advisory_lock_wait!(waiter_backend)
+
+    assert {:error, :event_snapshot_refresh_fence_failed} = Task.await(waiter, 5_000)
+
+    send(holder.pid, :commit_timeout_holder)
+    assert :ok = Task.await(holder, 5_000)
+    assert transaction_lock_available?(elem(EventSnapshotRefreshFence.lock_key(event_id), 1))
+  end
+
+  defp transaction_lock_available?(key) do
+    Task.async(fn ->
+      UnboxedPostgres.with_connection(fn ->
+        case Repo.query("SELECT pg_try_advisory_xact_lock($1::bigint)", [key]) do
+          {:ok, %{rows: [[true]]}} -> true
+          _ -> false
+        end
+      end)
+    end)
+    |> Task.await(5_000)
   end
 end
