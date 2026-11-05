@@ -496,6 +496,9 @@ else
 fi
 v6_null_result=$(parse_null_result 'V6' "$work_dir/v6-null.log") || fail 'v6 probe has missing, duplicate, or conflicting NULL-result notices'
 IFS=$'\t' read -r v6_null_kind v6_null_state v6_null_message <<< "$v6_null_result"
+[[ "$v6_null_kind" == 'ERROR' ]] || fail "v6 NULL result kind was '$v6_null_kind', expected ERROR"
+[[ "$v6_null_state" == '42883' ]] || fail "v6 NULL SQLSTATE was '$v6_null_state', expected 42883"
+[[ "$v6_null_message" == 'function ash_raise_error(jsonb, text) does not exist' ]] || fail "v6 NULL message was '$v6_null_message', expected missing ash_raise_error helper"
 printf 'V6_NULL_KIND=%s\n' "$v6_null_kind"
 printf 'V6_NULL_SQLSTATE=%s\n' "$v6_null_state"
 printf 'V6_NULL_MESSAGE=%s\n' "$v6_null_message"
@@ -728,7 +731,7 @@ v7_null_result=$(parse_null_result 'V7' "$work_dir/v7-transaction.log") || fail 
 IFS=$'\t' read -r v7_null_kind v7_null_state v7_null_message <<< "$v7_null_result"
 [[ "$v7_null_kind" == 'ERROR' ]] || fail "v7 NULL path returned instead of raising the expected Ash error ($v7_null_kind)"
 [[ "$v7_null_state" == 'P0001' ]] || fail "v7 NULL SQLSTATE was '$v7_null_state', expected P0001"
-[[ "$v7_null_message" == ash_error:* ]] || fail "v7 NULL message does not begin with ash_error: ($v7_null_message)"
+[[ "$v7_null_message" == 'ash_error: {"field": "required"}' ]] || fail "v7 NULL message was '$v7_null_message', expected ash_error payload for field required"
 printf 'V7_NULL_SQLSTATE=%s\n' "$v7_null_state"
 printf 'V7_NULL_MESSAGE=%s\n' "$v7_null_message"
 v7_null_current_user=$(notice_value 'V7_NULL_CURRENT_USER' "$work_dir/v7-transaction.log") || fail 'v7 NULL probe has a missing or duplicate current-user notice'
