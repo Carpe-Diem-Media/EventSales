@@ -35,7 +35,8 @@ defmodule EventSales.Analytics.SnapshotRefresh do
   @spec refresh_event(Ecto.UUID.t() | String.t(), keyword()) ::
           {:ok, [EventAggregateSnapshot.t()]} | {:error, term()}
   def refresh_event(event_id, opts \\ []) when is_binary(event_id) do
-    with {:ok, event_id} <- cast_uuid(event_id, :event_id) do
+    with {:ok, event_id} <- cast_uuid(event_id, :event_id),
+         :ok <- EventSnapshotRefreshFence.validate_refresh_transaction_boundary() do
       timezone = Keyword.get_lazy(opts, :business_timezone, &MetricRules.business_timezone/0)
       now = Keyword.get_lazy(opts, :now, &DateTime.utc_now/0)
       refreshed_at = Keyword.get_lazy(opts, :refreshed_at, &DateTime.utc_now/0)

@@ -33,6 +33,17 @@ defmodule EventSales.Analytics.EventSnapshotRefreshFence do
   end
 
   @doc false
+  @spec validate_refresh_transaction_boundary() ::
+          :ok | {:error, :event_snapshot_refresh_fence_failed}
+  def validate_refresh_transaction_boundary do
+    if Repo.in_transaction?() and not sandbox_test_transaction?() do
+      {:error, :event_snapshot_refresh_fence_failed}
+    else
+      :ok
+    end
+  end
+
+  @doc false
   @spec coherent_transaction_opts() :: Keyword.t()
   def coherent_transaction_opts do
     if use_repeatable_read_isolation?() do

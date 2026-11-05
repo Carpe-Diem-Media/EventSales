@@ -6,6 +6,7 @@ defmodule EventSales.Analytics.EventSnapshotRefreshConcurrencyTest do
   require Ash.Query
 
   alias EventSales.Analytics.{
+    DashboardCache,
     EventSnapshotRefreshFence,
     PeriodBucketRules,
     PeriodProjectionInvalidator,
@@ -30,6 +31,47 @@ defmodule EventSales.Analytics.EventSnapshotRefreshConcurrencyTest do
   alias EventSales.TestSupport.EventSnapshotRefreshTestSupport
   alias EventSales.TestSupport.{SalesHelpers, UnboxedPostgres}
   alias Oban.Job
+
+  test "event refresh rejects an active transaction before reads or cache invalidation" do
+    fixture = create_committed_fixture!()
+    on_exit(fn -> cleanup_committed_fixture!(fixture) end)
+
+    cached_summary = %{sentinel: :preserve_until_committed_refresh}
+    assert :ok = DashboardCache.put_event_summary(fixture.event_id, cached_summary)
+    on_exit(fn -> DashboardCache.invalidate_event(fixture.event_id, :test_cleanup) end)
+
+    assert {:ok, :ok} =
+             UnboxedPostgres.with_connection(fn ->
+               Repo.transaction(fn ->
+                 handler_id = {__MODULE__, self(), make_ref()}
+                 test_pid = self()
+
+                 :ok =
+                   :telemetry.attach(
+                     handler_id,
+                     Repo.config()[:telemetry_prefix] ++ [:query],
+                     fn _event, _measurements, metadata, {pid, id} ->
+                       send(pid, {id, metadata.query})
+                     end,
+                     {test_pid, handler_id}
+                   )
+
+                 try do
+                   assert {:error, :event_snapshot_refresh_fence_failed} =
+                            SnapshotRefresh.refresh_event(fixture.event_id)
+
+                   assert {:ok, ^cached_summary} =
+                            DashboardCache.get_event_summary(fixture.event_id)
+
+                   refute_receive {^handler_id, _query}, 0
+                 after
+                   :telemetry.detach(handler_id)
+                 end
+
+                 :ok
+               end)
+             end)
+  end
 
   test "same event refreshes serialize inside the PostgreSQL transaction fence" do
     fixture = create_committed_fixture!()
