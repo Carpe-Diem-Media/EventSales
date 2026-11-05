@@ -24,7 +24,7 @@ admin_psql() {
 }
 
 owner_psql() {
-  psql -X -q -w -v ON_ERROR_STOP=1 \
+  psql -X -q -A -t -w -v ON_ERROR_STOP=1 \
     -h "$ASH_PROOF_HOST" \
     -p "$ASH_PROOF_PORT" \
     -U "$OWNER_ROLE" \
@@ -33,7 +33,7 @@ owner_psql() {
 }
 
 caller_psql() {
-  psql -X -q -w -v ON_ERROR_STOP=1 \
+  psql -X -q -A -t -w -v ON_ERROR_STOP=1 \
     -h "$ASH_PROOF_HOST" \
     -p "$ASH_PROOF_PORT" \
     -U "$CALLER_ROLE" \
@@ -155,7 +155,97 @@ extract_function_ddl() {
 notice_value() {
   local label="$1"
   local log_file="$2"
-  sed -n "s/^NOTICE:[[:space:]]*${label}=//p" "$log_file"
+
+  awk -v label="$label" '
+    BEGIN { marker = label "=" }
+    {
+      line = $0
+      sub(/^psql:.*:[0-9]+:[[:space:]]*/, "", line)
+      if (line !~ /^NOTICE:[[:space:]]*/) next
+      sub(/^NOTICE:[[:space:]]*/, "", line)
+      if (index(line, marker) == 1) {
+        matches++
+        value = substr(line, length(marker) + 1)
+      }
+    }
+    END {
+      if (matches == 0) exit 1
+      if (matches != 1) exit 2
+      print value
+    }
+  ' "$log_file"
+}
+
+capture_labeled_value() {
+  local label="$1"
+  local log_file="$2"
+
+  awk -v label="$label" '
+    BEGIN { marker = label "=" }
+    index($0, marker) == 1 {
+      matches++
+      value = substr($0, length(marker) + 1)
+    }
+    END {
+      if (matches == 0) exit 1
+      if (matches != 1) exit 2
+      print value
+    }
+  ' "$log_file"
+}
+
+parse_null_result() {
+  local prefix="$1"
+  local log_file="$2"
+  local sqlstate=''
+  local message=''
+  local returned_null=''
+  local returned_value=''
+  local has_sqlstate=false
+  local has_message=false
+  local has_returned_null=false
+  local has_returned_value=false
+  local status
+
+  if sqlstate=$(notice_value "${prefix}_NULL_SQLSTATE" "$log_file"); then
+    has_sqlstate=true
+  else
+    status=$?
+    [[ "$status" == '1' ]] || return "$status"
+  fi
+
+  if message=$(notice_value "${prefix}_NULL_MESSAGE" "$log_file"); then
+    has_message=true
+  else
+    status=$?
+    [[ "$status" == '1' ]] || return "$status"
+  fi
+
+  if returned_null=$(notice_value "${prefix}_NULL_RETURNED" "$log_file"); then
+    has_returned_null=true
+  else
+    status=$?
+    [[ "$status" == '1' ]] || return "$status"
+  fi
+
+  if returned_value=$(notice_value "${prefix}_NULL_RETURNED_VALUE" "$log_file"); then
+    has_returned_value=true
+  else
+    status=$?
+    [[ "$status" == '1' ]] || return "$status"
+  fi
+
+  if [[ "$has_sqlstate" == true ]]; then
+    [[ "$has_message" == true && "$has_returned_null" == false && "$has_returned_value" == false ]] || return 1
+    [[ -n "$sqlstate" && -n "$message" ]] || return 1
+    printf 'ERROR\t%s\t%s\n' "$sqlstate" "$message"
+  elif [[ "$has_message" == false && "$has_returned_null" == true && "$has_returned_value" == false && "$returned_null" == 'NULL' ]]; then
+    printf 'RETURNED_NULL\tNONE\treturned NULL without an error\n'
+  elif [[ "$has_message" == false && "$has_returned_null" == false && "$has_returned_value" == true ]]; then
+    printf 'RETURNED_VALUE\tNONE\t%s\n' "$returned_value"
+  else
+    return 1
+  fi
 }
 
 cleanup_attempted=false
@@ -306,6 +396,7 @@ provisioning_started=true
 
 admin_psql -c "CREATE ROLE $OWNER_ROLE LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT NOBYPASSRLS"
 admin_psql -c "CREATE ROLE $CALLER_ROLE LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT NOBYPASSRLS"
+admin_psql -c "GRANT $CALLER_ROLE TO $OWNER_ROLE WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"
 admin_psql -c "CREATE DATABASE $PROOF_DATABASE OWNER $OWNER_ROLE"
 admin_psql -c "REVOKE ALL ON DATABASE $PROOF_DATABASE FROM PUBLIC"
 admin_psql -c "GRANT CONNECT ON DATABASE $PROOF_DATABASE TO $CALLER_ROLE"
@@ -313,6 +404,9 @@ admin_psql -c "GRANT CONNECT ON DATABASE $PROOF_DATABASE TO $CALLER_ROLE"
 role_metadata=$(capture_one admin_psql -Atq -c "SELECT string_agg(rolname || ':' || CASE WHEN rolsuper THEN '1' ELSE '0' END || ':' || CASE WHEN rolcreatedb THEN '1' ELSE '0' END || ':' || CASE WHEN rolcreaterole THEN '1' ELSE '0' END || ':' || CASE WHEN rolreplication THEN '1' ELSE '0' END || ':' || CASE WHEN rolinherit THEN '1' ELSE '0' END || ':' || CASE WHEN rolbypassrls THEN '1' ELSE '0' END, ',' ORDER BY rolname) FROM pg_roles WHERE rolname IN ('$OWNER_ROLE', '$CALLER_ROLE')") || fail 'could not inspect proof roles'
 printf 'PROOF_ROLE_METADATA=%s\n' "$role_metadata"
 [[ "$role_metadata" == "$CALLER_ROLE:0:0:0:0:0:0,$OWNER_ROLE:0:0:0:0:0:0" ]] || fail 'proof roles have broader privileges than expected'
+role_membership_options=$(capture_one admin_psql -Atq -c "SELECT CASE WHEN pg_has_role('$OWNER_ROLE', '$CALLER_ROLE', 'MEMBER') AND pg_has_role('$OWNER_ROLE', '$CALLER_ROLE', 'SET') AND NOT pg_has_role('$OWNER_ROLE', '$CALLER_ROLE', 'USAGE') AND (SELECT count(*) = 1 AND bool_and(set_option) AND NOT bool_or(inherit_option) AND NOT bool_or(admin_option) FROM pg_auth_members AS membership JOIN pg_roles AS target ON target.oid = membership.roleid JOIN pg_roles AS member ON member.oid = membership.member WHERE target.rolname = '$CALLER_ROLE' AND member.rolname = '$OWNER_ROLE') THEN 'PASS' ELSE 'FAIL' END") || fail 'could not inspect restricted role membership options'
+[[ "$role_membership_options" == 'PASS' ]] || fail 'owner-to-caller role membership must allow SET only, without inheritance or admin'
+printf 'OWNER_TO_CALLER_ROLE_MEMBERSHIP=SET_ONLY\n'
 
 cat > "$v6_setup_sql" <<'SQL'
 SET search_path = public;
@@ -400,25 +494,16 @@ else
   cat "$work_dir/v6-null.log" >&2
   fail 'v6 typed NULL probe could not complete under the restricted caller role'
 fi
-v6_null_state=$(notice_value 'V6_NULL_SQLSTATE' "$work_dir/v6-null.log")
-v6_null_message=$(notice_value 'V6_NULL_MESSAGE' "$work_dir/v6-null.log")
-if [[ -z "$v6_null_state" ]]; then
-  if grep -Eq '^NOTICE:[[:space:]]*V6_NULL_RETURNED=NULL$' "$work_dir/v6-null.log"; then
-    v6_null_state='NONE'
-    v6_null_message='returned NULL without an error'
-  elif grep -Eq '^NOTICE:[[:space:]]*V6_NULL_RETURNED_VALUE=' "$work_dir/v6-null.log"; then
-    v6_null_state='NONE'
-    v6_null_message=$(sed -n 's/^NOTICE:[[:space:]]*V6_NULL_RETURNED_VALUE=//p' "$work_dir/v6-null.log")
-  else
-    fail 'v6 probe did not report either an error or a return value'
-  fi
-fi
-[[ -n "$v6_null_message" ]] || fail 'v6 NULL probe did not capture an error message or return description'
+v6_null_result=$(parse_null_result 'V6' "$work_dir/v6-null.log") || fail 'v6 probe has missing, duplicate, or conflicting NULL-result notices'
+IFS=$'\t' read -r v6_null_kind v6_null_state v6_null_message <<< "$v6_null_result"
+printf 'V6_NULL_KIND=%s\n' "$v6_null_kind"
 printf 'V6_NULL_SQLSTATE=%s\n' "$v6_null_state"
 printf 'V6_NULL_MESSAGE=%s\n' "$v6_null_message"
 
-grep -Fq 'V6_NULL_CURRENT_USER=jc361_ash_functions_caller' "$work_dir/v6-null.log" || fail 'v6 NULL call did not run as the restricted caller'
-grep -Fq 'V6_SAVEPOINT_RECOVERED=1' "$work_dir/v6-null.log" || fail 'v6 NULL probe did not recover to its savepoint'
+v6_null_current_user=$(notice_value 'V6_NULL_CURRENT_USER' "$work_dir/v6-null.log") || fail 'v6 NULL probe has a missing or duplicate current-user notice'
+[[ "$v6_null_current_user" == "$CALLER_ROLE" ]] || fail 'v6 NULL call did not run as the restricted caller'
+v6_savepoint_recovered=$(capture_labeled_value 'V6_SAVEPOINT_RECOVERED' "$work_dir/v6-null.log") || fail 'v6 NULL probe has a missing or duplicate savepoint result'
+[[ "$v6_savepoint_recovered" == '1' ]] || fail 'v6 NULL probe did not recover to its savepoint'
 
 v6_nonnull=$(capture_one caller_psql -Atq -c "SELECT public.ash_required('jc361-proof-value'::text, '{\"field\":\"required\"}'::jsonb)") || fail 'v6 typed non-NULL call failed'
 [[ "$v6_nonnull" == 'jc361-proof-value' ]] || fail "unexpected v6 non-NULL result: $v6_nonnull"
@@ -447,17 +532,33 @@ SQL
   cat <<'SQL'
 \echo V7_FUNCTION_REPLACED_ONCE
 SELECT 'V7_IDENTITY_ONCE=' || (SELECT concat_ws(E'\t', p.oid::text, n.nspname, pg_get_function_identity_arguments(p.oid), pg_get_function_result(p.oid), pg_get_userbyid(p.proowner), COALESCE(p.proacl::text, '<NULL>'), COALESCE(p.proconfig::text, '<NULL>'), l.lanname, p.provolatile::text, p.prosecdef::text, p.proisstrict::text, p.proparallel::text) FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace JOIN pg_language AS l ON l.oid = p.prolang WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2);
-SELECT (SELECT concat_ws(E'\t', p.oid::text, n.nspname, pg_get_function_identity_arguments(p.oid), pg_get_function_result(p.oid), pg_get_userbyid(p.proowner), COALESCE(p.proacl::text, '<NULL>'), COALESCE(p.proconfig::text, '<NULL>'), l.lanname, p.provolatile::text, p.prosecdef::text, p.proisstrict::text, p.proparallel::text) FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace JOIN pg_language AS l ON l.oid = p.prolang WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2) = (SELECT function_identity FROM pg_temp.jc361_v6_baseline) AS v7_identity_once_matches
-\gset
-\if :v7_identity_once_matches
+DO $jc361_assert$
+DECLARE
+  identity_matches boolean;
+BEGIN
+  SELECT concat_ws(E'\t', p.oid::text, n.nspname, pg_get_function_identity_arguments(p.oid), pg_get_function_result(p.oid), pg_get_userbyid(p.proowner), COALESCE(p.proacl::text, '<NULL>'), COALESCE(p.proconfig::text, '<NULL>'), l.lanname, p.provolatile::text, p.prosecdef::text, p.proisstrict::text, p.proparallel::text) = (SELECT function_identity FROM pg_temp.jc361_v6_baseline)
+  INTO identity_matches
+  FROM pg_proc AS p
+  JOIN pg_namespace AS n ON n.oid = p.pronamespace
+  JOIN pg_language AS l ON l.oid = p.prolang
+  WHERE n.nspname = 'public'
+    AND p.proname = 'ash_required'
+    AND p.pronargs = 2;
+
+  IF identity_matches IS DISTINCT FROM TRUE THEN
+    RAISE EXCEPTION 'v7 replacement changed function identity or permissions';
+  END IF;
+END;
+$jc361_assert$;
 \echo V7_IDENTITY_PRESERVED=PASS
-\else
-\echo V7_IDENTITY_PRESERVED=FAIL
-\quit 1
-\endif
-SELECT 'V7_BODY_MD5_ONCE=' || (SELECT md5(pg_get_functiondef(p.oid)) FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2);
-SELECT md5(pg_get_functiondef(p.oid)) AS v7_body_md5_once FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2
-\gset
+CREATE TEMP TABLE jc361_v7_baseline AS
+SELECT md5(pg_get_functiondef(p.oid)) AS body_md5
+FROM pg_proc AS p
+JOIN pg_namespace AS n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proname = 'ash_required'
+  AND p.pronargs = 2;
+SELECT 'V7_BODY_MD5_ONCE=' || body_md5 FROM pg_temp.jc361_v7_baseline;
 SELECT 'V7_PG_PROC=' || (SELECT jsonb_build_object('oid', p.oid, 'schema', n.nspname, 'signature', pg_get_function_identity_arguments(p.oid), 'return_type', pg_get_function_result(p.oid), 'owner', pg_get_userbyid(p.proowner), 'acl', COALESCE(p.proacl::text, '<NULL>'), 'proconfig', COALESCE(p.proconfig::text, '<NULL>'), 'language', l.lanname, 'volatility', p.provolatile, 'security_definer', p.prosecdef, 'strict', p.proisstrict, 'parallel', p.proparallel, 'definition', pg_get_functiondef(p.oid))::text FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace JOIN pg_language AS l ON l.oid = p.prolang WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2);
 \echo V7_FUNCTION_DEFINITION_BEGIN
 SELECT pg_get_functiondef(p.oid) FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2;
@@ -498,50 +599,102 @@ SQL
 \echo V7_FUNCTION_REPLACED_TWICE
 SELECT 'V7_IDENTITY_REPEAT=' || (SELECT concat_ws(E'\t', p.oid::text, n.nspname, pg_get_function_identity_arguments(p.oid), pg_get_function_result(p.oid), pg_get_userbyid(p.proowner), COALESCE(p.proacl::text, '<NULL>'), COALESCE(p.proconfig::text, '<NULL>'), l.lanname, p.provolatile::text, p.prosecdef::text, p.proisstrict::text, p.proparallel::text) FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace JOIN pg_language AS l ON l.oid = p.prolang WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2);
 SELECT 'V7_BODY_MD5_REPEAT=' || (SELECT md5(pg_get_functiondef(p.oid)) FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2);
-SELECT (SELECT concat_ws(E'\t', p.oid::text, n.nspname, pg_get_function_identity_arguments(p.oid), pg_get_function_result(p.oid), pg_get_userbyid(p.proowner), COALESCE(p.proacl::text, '<NULL>'), COALESCE(p.proconfig::text, '<NULL>'), l.lanname, p.provolatile::text, p.prosecdef::text, p.proisstrict::text, p.proparallel::text) FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace JOIN pg_language AS l ON l.oid = p.prolang WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2) = (SELECT function_identity FROM pg_temp.jc361_v6_baseline) AS v7_identity_repeat_matches
-\gset
-\if :v7_identity_repeat_matches
+DO $jc361_assert$
+DECLARE
+  identity_matches boolean;
+BEGIN
+  SELECT concat_ws(E'\t', p.oid::text, n.nspname, pg_get_function_identity_arguments(p.oid), pg_get_function_result(p.oid), pg_get_userbyid(p.proowner), COALESCE(p.proacl::text, '<NULL>'), COALESCE(p.proconfig::text, '<NULL>'), l.lanname, p.provolatile::text, p.prosecdef::text, p.proisstrict::text, p.proparallel::text) = (SELECT function_identity FROM pg_temp.jc361_v6_baseline)
+  INTO identity_matches
+  FROM pg_proc AS p
+  JOIN pg_namespace AS n ON n.oid = p.pronamespace
+  JOIN pg_language AS l ON l.oid = p.prolang
+  WHERE n.nspname = 'public'
+    AND p.proname = 'ash_required'
+    AND p.pronargs = 2;
+
+  IF identity_matches IS DISTINCT FROM TRUE THEN
+    RAISE EXCEPTION 'repeated v7 replacement changed function identity or permissions';
+  END IF;
+END;
+$jc361_assert$;
 \echo V7_REPEAT_IDENTITY_PRESERVED=PASS
-\else
-\echo V7_REPEAT_IDENTITY_PRESERVED=FAIL
-\quit 1
-\endif
-SELECT md5(pg_get_functiondef(p.oid)) = :'v7_body_md5_once' AS v7_body_repeat_matches FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2
-\gset
-\if :v7_body_repeat_matches
+DO $jc361_assert$
+DECLARE
+  body_matches boolean;
+BEGIN
+  SELECT md5(pg_get_functiondef(p.oid)) = (SELECT body_md5 FROM pg_temp.jc361_v7_baseline)
+  INTO body_matches
+  FROM pg_proc AS p
+  JOIN pg_namespace AS n ON n.oid = p.pronamespace
+  WHERE n.nspname = 'public'
+    AND p.proname = 'ash_required'
+    AND p.pronargs = 2;
+
+  IF body_matches IS DISTINCT FROM TRUE THEN
+    RAISE EXCEPTION 'repeated v7 replacement changed the function definition';
+  END IF;
+END;
+$jc361_assert$;
 \echo V7_REPEAT_BODY_PRESERVED=PASS
-\else
-\echo V7_REPEAT_BODY_PRESERVED=FAIL
-\quit 1
-\endif
 ROLLBACK;
 \echo V7_TRANSACTION_ROLLED_BACK
 SELECT 'ROLLBACK_IDENTITY=' || (SELECT concat_ws(E'\t', p.oid::text, n.nspname, pg_get_function_identity_arguments(p.oid), pg_get_function_result(p.oid), pg_get_userbyid(p.proowner), COALESCE(p.proacl::text, '<NULL>'), COALESCE(p.proconfig::text, '<NULL>'), l.lanname, p.provolatile::text, p.prosecdef::text, p.proisstrict::text, p.proparallel::text) FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace JOIN pg_language AS l ON l.oid = p.prolang WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2);
 SELECT 'ROLLBACK_BODY_MD5=' || (SELECT md5(pg_get_functiondef(p.oid)) FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2);
-SELECT (SELECT concat_ws(E'\t', p.oid::text, n.nspname, pg_get_function_identity_arguments(p.oid), pg_get_function_result(p.oid), pg_get_userbyid(p.proowner), COALESCE(p.proacl::text, '<NULL>'), COALESCE(p.proconfig::text, '<NULL>'), l.lanname, p.provolatile::text, p.prosecdef::text, p.proisstrict::text, p.proparallel::text) FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace JOIN pg_language AS l ON l.oid = p.prolang WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2) = (SELECT function_identity FROM pg_temp.jc361_v6_baseline) AS rollback_identity_matches
-\gset
-\if :rollback_identity_matches
+DO $jc361_assert$
+DECLARE
+  identity_matches boolean;
+BEGIN
+  SELECT concat_ws(E'\t', p.oid::text, n.nspname, pg_get_function_identity_arguments(p.oid), pg_get_function_result(p.oid), pg_get_userbyid(p.proowner), COALESCE(p.proacl::text, '<NULL>'), COALESCE(p.proconfig::text, '<NULL>'), l.lanname, p.provolatile::text, p.prosecdef::text, p.proisstrict::text, p.proparallel::text) = (SELECT function_identity FROM pg_temp.jc361_v6_baseline)
+  INTO identity_matches
+  FROM pg_proc AS p
+  JOIN pg_namespace AS n ON n.oid = p.pronamespace
+  JOIN pg_language AS l ON l.oid = p.prolang
+  WHERE n.nspname = 'public'
+    AND p.proname = 'ash_required'
+    AND p.pronargs = 2;
+
+  IF identity_matches IS DISTINCT FROM TRUE THEN
+    RAISE EXCEPTION 'transaction rollback did not restore function identity or permissions';
+  END IF;
+END;
+$jc361_assert$;
 \echo ROLLBACK_IDENTITY_RESTORED=PASS
-\else
-\echo ROLLBACK_IDENTITY_RESTORED=FAIL
-\quit 1
-\endif
-SELECT md5(pg_get_functiondef(p.oid)) = (SELECT body_md5 FROM pg_temp.jc361_v6_baseline) AS rollback_body_matches FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2
-\gset
-\if :rollback_body_matches
+DO $jc361_assert$
+DECLARE
+  body_matches boolean;
+BEGIN
+  SELECT md5(pg_get_functiondef(p.oid)) = (SELECT body_md5 FROM pg_temp.jc361_v6_baseline)
+  INTO body_matches
+  FROM pg_proc AS p
+  JOIN pg_namespace AS n ON n.oid = p.pronamespace
+  WHERE n.nspname = 'public'
+    AND p.proname = 'ash_required'
+    AND p.pronargs = 2;
+
+  IF body_matches IS DISTINCT FROM TRUE THEN
+    RAISE EXCEPTION 'transaction rollback did not restore the v6 function body';
+  END IF;
+END;
+$jc361_assert$;
 \echo ROLLBACK_BODY_RESTORED=PASS
-\else
-\echo ROLLBACK_BODY_RESTORED=FAIL
-\quit 1
-\endif
-SELECT pg_get_functiondef(p.oid) = (SELECT definition FROM pg_temp.jc361_v6_baseline) AS rollback_definition_matches FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2
-\gset
-\if :rollback_definition_matches
+DO $jc361_assert$
+DECLARE
+  definition_matches boolean;
+BEGIN
+  SELECT pg_get_functiondef(p.oid) = (SELECT definition FROM pg_temp.jc361_v6_baseline)
+  INTO definition_matches
+  FROM pg_proc AS p
+  JOIN pg_namespace AS n ON n.oid = p.pronamespace
+  WHERE n.nspname = 'public'
+    AND p.proname = 'ash_required'
+    AND p.pronargs = 2;
+
+  IF definition_matches IS DISTINCT FROM TRUE THEN
+    RAISE EXCEPTION 'transaction rollback did not restore the exact v6 definition';
+  END IF;
+END;
+$jc361_assert$;
 \echo ROLLBACK_DEFINITION_RESTORED=PASS
-\else
-\echo ROLLBACK_DEFINITION_RESTORED=FAIL
-\quit 1
-\endif
 SELECT 'ROLLBACK_PG_PROC=' || (SELECT jsonb_build_object('oid', p.oid, 'schema', n.nspname, 'signature', pg_get_function_identity_arguments(p.oid), 'return_type', pg_get_function_result(p.oid), 'owner', pg_get_userbyid(p.proowner), 'acl', COALESCE(p.proacl::text, '<NULL>'), 'proconfig', COALESCE(p.proconfig::text, '<NULL>'), 'language', l.lanname, 'volatility', p.provolatile, 'security_definer', p.prosecdef, 'strict', p.proisstrict, 'parallel', p.proparallel, 'definition', pg_get_functiondef(p.oid))::text FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace JOIN pg_language AS l ON l.oid = p.prolang WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2);
 \echo ROLLBACK_FUNCTION_DEFINITION_BEGIN
 SELECT pg_get_functiondef(p.oid) FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'ash_required' AND p.pronargs = 2;
@@ -556,13 +709,12 @@ else
   fail 'v7 replacement transaction or rollback verification failed'
 fi
 
-v7_identity_once=$(sed -n 's/^V7_IDENTITY_ONCE=//p' "$work_dir/v7-transaction.log")
-v7_identity_repeat=$(sed -n 's/^V7_IDENTITY_REPEAT=//p' "$work_dir/v7-transaction.log")
-v7_body_once=$(sed -n 's/^V7_BODY_MD5_ONCE=//p' "$work_dir/v7-transaction.log")
-v7_body_repeat=$(sed -n 's/^V7_BODY_MD5_REPEAT=//p' "$work_dir/v7-transaction.log")
-rollback_identity=$(sed -n 's/^ROLLBACK_IDENTITY=//p' "$work_dir/v7-transaction.log")
-rollback_body=$(sed -n 's/^ROLLBACK_BODY_MD5=//p' "$work_dir/v7-transaction.log")
-[[ -n "$v7_identity_once" && -n "$v7_identity_repeat" && -n "$v7_body_once" && -n "$v7_body_repeat" && -n "$rollback_identity" && -n "$rollback_body" ]] || fail 'transaction log is missing pg_proc identity or body hashes'
+v7_identity_once=$(capture_labeled_value 'V7_IDENTITY_ONCE' "$work_dir/v7-transaction.log") || fail 'transaction log has a missing or duplicate first-replacement identity'
+v7_identity_repeat=$(capture_labeled_value 'V7_IDENTITY_REPEAT' "$work_dir/v7-transaction.log") || fail 'transaction log has a missing or duplicate repeated-replacement identity'
+v7_body_once=$(capture_labeled_value 'V7_BODY_MD5_ONCE' "$work_dir/v7-transaction.log") || fail 'transaction log has a missing or duplicate first-replacement body hash'
+v7_body_repeat=$(capture_labeled_value 'V7_BODY_MD5_REPEAT' "$work_dir/v7-transaction.log") || fail 'transaction log has a missing or duplicate repeated-replacement body hash'
+rollback_identity=$(capture_labeled_value 'ROLLBACK_IDENTITY' "$work_dir/v7-transaction.log") || fail 'transaction log has a missing or duplicate rollback identity'
+rollback_body=$(capture_labeled_value 'ROLLBACK_BODY_MD5' "$work_dir/v7-transaction.log") || fail 'transaction log has a missing or duplicate rollback body hash'
 [[ "$v7_identity_once" == "$v6_identity" ]] || fail 'schema, signature, OID, owner, ACL, configuration, or function properties changed during replacement'
 [[ "$v7_identity_repeat" == "$v6_identity" ]] || fail 'repeated replacement changed function identity or permissions'
 [[ "$v7_body_once" == "$v7_body_repeat" ]] || fail 'repeated replacement changed the generated v7 SQL definition'
@@ -572,17 +724,21 @@ rollback_definition_file="$work_dir/rollback.pg_get_functiondef.sql"
 owner_psql -Atq -c "$(function_definition_sql)" > "$rollback_definition_file"
 cmp -s "$v6_definition_file" "$rollback_definition_file" || fail 'pg_get_functiondef differs after rollback'
 
-v7_null_state=$(notice_value 'V7_NULL_SQLSTATE' "$work_dir/v7-transaction.log")
-v7_null_message=$(notice_value 'V7_NULL_MESSAGE' "$work_dir/v7-transaction.log")
+v7_null_result=$(parse_null_result 'V7' "$work_dir/v7-transaction.log") || fail 'v7 probe has missing, duplicate, or conflicting NULL-result notices'
+IFS=$'\t' read -r v7_null_kind v7_null_state v7_null_message <<< "$v7_null_result"
+[[ "$v7_null_kind" == 'ERROR' ]] || fail "v7 NULL path returned instead of raising the expected Ash error ($v7_null_kind)"
 [[ "$v7_null_state" == 'P0001' ]] || fail "v7 NULL SQLSTATE was '$v7_null_state', expected P0001"
 [[ "$v7_null_message" == ash_error:* ]] || fail "v7 NULL message does not begin with ash_error: ($v7_null_message)"
 printf 'V7_NULL_SQLSTATE=%s\n' "$v7_null_state"
 printf 'V7_NULL_MESSAGE=%s\n' "$v7_null_message"
-grep -Fq 'V7_NULL_CURRENT_USER=jc361_ash_functions_caller' "$work_dir/v7-transaction.log" || fail 'v7 NULL call did not run as the restricted caller'
-grep -Fq 'V7_NONNULL_CURRENT_USER=jc361_ash_functions_caller' "$work_dir/v7-transaction.log" || fail 'v7 non-NULL call did not run as the restricted caller'
-v7_nonnull=$(sed -n 's/^V7_NONNULL_RESULT=//p' "$work_dir/v7-transaction.log")
+v7_null_current_user=$(notice_value 'V7_NULL_CURRENT_USER' "$work_dir/v7-transaction.log") || fail 'v7 NULL probe has a missing or duplicate current-user notice'
+[[ "$v7_null_current_user" == "$CALLER_ROLE" ]] || fail 'v7 NULL call did not run as the restricted caller'
+v7_nonnull_current_user=$(capture_labeled_value 'V7_NONNULL_CURRENT_USER' "$work_dir/v7-transaction.log") || fail 'v7 non-NULL probe has a missing or duplicate current-user result'
+[[ "$v7_nonnull_current_user" == "$CALLER_ROLE" ]] || fail 'v7 non-NULL call did not run as the restricted caller'
+v7_nonnull=$(capture_labeled_value 'V7_NONNULL_RESULT' "$work_dir/v7-transaction.log") || fail 'v7 non-NULL probe has a missing or duplicate result'
 [[ "$v7_nonnull" == "$v6_nonnull" ]] || fail 'non-NULL result changed between v6 and v7'
-grep -Fq 'V7_SAVEPOINT_RECOVERED=1' "$work_dir/v7-transaction.log" || fail 'v7 NULL probe did not recover to its savepoint'
+v7_savepoint_recovered=$(capture_labeled_value 'V7_SAVEPOINT_RECOVERED' "$work_dir/v7-transaction.log") || fail 'v7 NULL probe has a missing or duplicate savepoint result'
+[[ "$v7_savepoint_recovered" == '1' ]] || fail 'v7 NULL probe did not recover to its savepoint'
 
 rollback_v6_sql="$work_dir/rollback-v6-null-probe.sql"
 sed 's/V6/ROLLBACK_V6/g' "$work_dir/v6-null-probe.sql" > "$rollback_v6_sql"
@@ -592,20 +748,13 @@ else
   cat "$work_dir/rollback-v6-null.log" >&2
   fail 'post-rollback v6 NULL behavior could not be checked'
 fi
-rollback_v6_state=$(notice_value 'ROLLBACK_V6_NULL_SQLSTATE' "$work_dir/rollback-v6-null.log")
-rollback_v6_message=$(notice_value 'ROLLBACK_V6_NULL_MESSAGE' "$work_dir/rollback-v6-null.log")
-if [[ -z "$rollback_v6_state" ]]; then
-  if grep -Eq '^NOTICE:[[:space:]]*ROLLBACK_V6_NULL_RETURNED=NULL$' "$work_dir/rollback-v6-null.log"; then
-    rollback_v6_state='NONE'
-    rollback_v6_message='returned NULL without an error'
-  elif grep -Eq '^NOTICE:[[:space:]]*ROLLBACK_V6_NULL_RETURNED_VALUE=' "$work_dir/rollback-v6-null.log"; then
-    rollback_v6_state='NONE'
-    rollback_v6_message=$(sed -n 's/^NOTICE:[[:space:]]*ROLLBACK_V6_NULL_RETURNED_VALUE=//p' "$work_dir/rollback-v6-null.log")
-  else
-    fail 'post-rollback v6 probe did not report an error or return value'
-  fi
-fi
-[[ "$rollback_v6_state" == "$v6_null_state" && "$rollback_v6_message" == "$v6_null_message" ]] || fail 'post-rollback v6 NULL behavior differs from the original v6 call'
+rollback_v6_result=$(parse_null_result 'ROLLBACK_V6' "$work_dir/rollback-v6-null.log") || fail 'post-rollback v6 probe has missing, duplicate, or conflicting NULL-result notices'
+IFS=$'\t' read -r rollback_v6_kind rollback_v6_state rollback_v6_message <<< "$rollback_v6_result"
+[[ "$rollback_v6_kind" == "$v6_null_kind" && "$rollback_v6_state" == "$v6_null_state" && "$rollback_v6_message" == "$v6_null_message" ]] || fail 'post-rollback v6 NULL behavior differs from the original v6 call'
+rollback_v6_current_user=$(notice_value 'ROLLBACK_V6_NULL_CURRENT_USER' "$work_dir/rollback-v6-null.log") || fail 'post-rollback v6 probe has a missing or duplicate current-user notice'
+[[ "$rollback_v6_current_user" == "$CALLER_ROLE" ]] || fail 'post-rollback v6 NULL call did not run as the restricted caller'
+rollback_v6_savepoint=$(capture_labeled_value 'ROLLBACK_V6_SAVEPOINT_RECOVERED' "$work_dir/rollback-v6-null.log") || fail 'post-rollback v6 probe has a missing or duplicate savepoint result'
+[[ "$rollback_v6_savepoint" == '1' ]] || fail 'post-rollback v6 probe did not recover to its savepoint'
 
 rollback_nonnull=$(capture_one caller_psql -Atq -c "SELECT public.ash_required('jc361-proof-value'::text, '{\"field\":\"required\"}'::jsonb)") || fail 'post-rollback v6 non-NULL call failed'
 [[ "$rollback_nonnull" == "$v6_nonnull" ]] || fail 'post-rollback non-NULL behavior differs from original v6'
