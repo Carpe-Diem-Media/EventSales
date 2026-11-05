@@ -11,15 +11,36 @@ defmodule EventSales.Analytics.EventSnapshotRefreshFence do
   @spec with_serial_event_refresh(Ecto.UUID.t() | String.t(), (-> result)) :: result
         when result: var
   def with_serial_event_refresh(event_id, fun) when is_binary(event_id) and is_function(fun, 0) do
-    with {:ok, key} <- lock_key(event_id),
-         {:ok, result} <- checkout_with_session_lock(key, fun) do
-      result
+    with {:ok, key} <- lock_key(event_id) do
+      Repo.transaction(
+        fn ->
+          set_refresh_transaction_isolation!()
+          acquire_refresh_transaction_lock!(key)
+          run_refresh_callback!(fun)
+        end,
+        timeout: 120_000
+      )
+      |> case do
+        {:ok, result} -> result
+        {:error, reason} -> {:error, reason}
+      end
     end
   rescue
     _error -> {:error, :event_snapshot_refresh_fence_failed}
   catch
     :exit, _reason -> {:error, :event_snapshot_refresh_fence_failed}
     :throw, _value -> {:error, :event_snapshot_refresh_fence_failed}
+  end
+
+  @doc false
+  @spec validate_refresh_transaction_boundary() ::
+          :ok | {:error, :event_snapshot_refresh_fence_failed}
+  def validate_refresh_transaction_boundary do
+    if Repo.in_transaction?() and not sandbox_test_transaction?() do
+      {:error, :event_snapshot_refresh_fence_failed}
+    else
+      :ok
+    end
   end
 
   @doc false
@@ -132,84 +153,33 @@ defmodule EventSales.Analytics.EventSnapshotRefreshFence do
     end
   end
 
-  defp checkout_with_session_lock(key, fun) do
-    result =
-      Repo.checkout(fn ->
-        with :ok <- take_session_lock(key) do
-          {:ok, run_while_holding_lock(key, fun)}
-        end
-      end)
-
-    case result do
-      :ok = ok -> ok
-      {:ok, _} = ok -> ok
-      {:error, _} = error -> error
-      other -> other
+  defp set_refresh_transaction_isolation! do
+    if sandbox_test_transaction?() do
+      :ok
+    else
+      case Repo.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", []) do
+        {:ok, _result} -> :ok
+        {:error, _reason} -> Repo.rollback(:event_snapshot_refresh_fence_failed)
+      end
     end
   end
 
-  defp run_while_holding_lock(key, fun) do
-    fun.()
-  after
-    release_session_lock!(key)
+  defp sandbox_test_transaction? do
+    Repo.config()[:pool] == Ecto.Adapters.SQL.Sandbox and Repo.in_transaction?() and
+      Process.get(:ecto_sandbox_unboxed) != true
   end
 
-  defp take_session_lock(key) do
-    case Repo.query("SELECT pg_advisory_lock($1::bigint)", [key]) do
-      {:ok, _} -> :ok
-      {:error, _reason} -> {:error, :event_snapshot_refresh_fence_failed}
+  defp acquire_refresh_transaction_lock!(key) do
+    case Repo.query("SELECT pg_advisory_xact_lock($1::bigint)", [key]) do
+      {:ok, _result} -> :ok
+      {:error, _reason} -> Repo.rollback(:event_snapshot_refresh_fence_failed)
     end
   end
 
-  defp release_session_lock!(key) do
-    case Repo.query("SELECT pg_advisory_unlock($1::bigint)", [key]) do
-      {:ok, %{rows: [[true]]}} ->
-        :ok
-
-      {:ok, %{rows: [[false]]}} ->
-        ensure_session_unlocked!(:unlock_returned_false)
-
-      {:ok, other} ->
-        ensure_session_unlocked!({:unexpected_unlock_result, other})
-
-      {:error, reason} ->
-        ensure_session_unlocked!(reason)
-    end
-  end
-
-  defp ensure_session_unlocked!(unlock_detail) do
-    case Repo.query("SELECT pg_advisory_unlock_all()") do
-      {:ok, _} ->
-        :ok
-
-      {:error, reason} ->
-        discard_locked_checkout_connection!(unlock_detail, reason)
-    end
-  end
-
-  defp discard_locked_checkout_connection!(unlock_detail, unlock_all_reason) do
-    message =
-      "event snapshot refresh fence could not release session advisory lock: " <>
-        inspect(%{unlock: unlock_detail, unlock_all: unlock_all_reason})
-
-    exception = DBConnection.ConnectionError.exception(message: message)
-
-    case checkout_pool_ref() do
-      :none ->
-        raise exception
-
-      pool_ref ->
-        :ok = DBConnection.Holder.disconnect(pool_ref, exception)
-        raise exception
-    end
-  end
-
-  defp checkout_pool_ref do
-    %{pid: pool} = Ecto.Adapter.lookup_meta(Repo.get_dynamic_repo())
-
-    case Process.get({Ecto.Adapters.SQL, pool}) do
-      %DBConnection{pool_ref: pool_ref} -> pool_ref
-      _ -> :none
+  defp run_refresh_callback!(fun) do
+    case fun.() do
+      {:error, reason} -> Repo.rollback(reason)
+      result -> result
     end
   end
 end

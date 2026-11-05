@@ -36,7 +36,7 @@ defmodule EventSales.Analytics.SnapshotRefresh do
           {:ok, [EventAggregateSnapshot.t()]} | {:error, term()}
   def refresh_event(event_id, opts \\ []) when is_binary(event_id) do
     with {:ok, event_id} <- cast_uuid(event_id, :event_id),
-         {:ok, _event} <- fetch_event(event_id) do
+         :ok <- EventSnapshotRefreshFence.validate_refresh_transaction_boundary() do
       timezone = Keyword.get_lazy(opts, :business_timezone, &MetricRules.business_timezone/0)
       now = Keyword.get_lazy(opts, :now, &DateTime.utc_now/0)
       refreshed_at = Keyword.get_lazy(opts, :refreshed_at, &DateTime.utc_now/0)
@@ -89,35 +89,27 @@ defmodule EventSales.Analytics.SnapshotRefresh do
 
   defp refresh_event_transaction(event_id, timezone, now, refreshed_at) do
     EventSnapshotRefreshFence.with_serial_event_refresh(event_id, fn ->
-      refresh_event_in_coherent_transaction(event_id, timezone, now, refreshed_at)
+      refresh_event_in_fenced_transaction(event_id, timezone, now, refreshed_at)
     end)
   end
 
-  defp refresh_event_in_coherent_transaction(event_id, timezone, now, refreshed_at) do
-    transaction_opts =
-      [timeout: 120_000] ++ EventSnapshotRefreshFence.coherent_transaction_opts()
-
-    Repo.transaction(
-      fn -> refresh_event_projection_or_rollback(event_id, timezone, now, refreshed_at) end,
-      transaction_opts
-    )
-  end
-
-  defp refresh_event_projection_or_rollback(event_id, timezone, now, refreshed_at) do
-    case refresh_event_projection_set!(event_id, timezone, now, refreshed_at) do
-      {:ok, snapshots} -> snapshots
+  defp refresh_event_in_fenced_transaction(event_id, timezone, now, refreshed_at) do
+    with {:ok, event} <- fetch_event(event_id),
+         {:ok, snapshots} <-
+           refresh_event_projection_set!(event_id, event, timezone, now, refreshed_at) do
+      {:ok, snapshots}
+    else
       {:error, reason} -> Repo.rollback(reason)
     end
   end
 
-  defp refresh_event_projection_set!(event_id, timezone, now, refreshed_at) do
+  defp refresh_event_projection_set!(event_id, event, timezone, now, refreshed_at) do
     projection_refreshed_at = DateTime.truncate(refreshed_at, :microsecond)
     persisted_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
     with {:ok, summaries} <- EventAggregator.financial_summaries_for_event(event_id),
          {:ok, dimension_rows} <- DimensionAggregator.financial_rows_for_event(event_id),
          {:ok, legacy_summary} <- legacy_summary_for_refresh(event_id, timezone, now),
-         {:ok, event} <- fetch_event(event_id),
          :ok <- validate_dimension_rows_for_persist!(event, dimension_rows) do
       {source_row_count, source_watermark_at} = event_source_metadata(event_id)
 

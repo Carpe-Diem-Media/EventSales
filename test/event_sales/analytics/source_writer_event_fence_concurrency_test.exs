@@ -136,7 +136,7 @@ defmodule EventSales.Analytics.SourceWriterEventFenceConcurrencyTest do
     }
 
     parent = self()
-    holder = start_session_fence(parent, fixture.event.id)
+    holder = start_refresh_transaction_fence(parent, fixture.event.id)
 
     writer =
       Task.async(fn ->
@@ -199,7 +199,7 @@ defmodule EventSales.Analytics.SourceWriterEventFenceConcurrencyTest do
   test "a refund without an event candidate does not wait on an unrelated event fence" do
     fixture = create_mapped_fixture!() |> register_fixture_cleanup!()
     parent = self()
-    holder = start_session_fence(parent, fixture.event.id)
+    holder = start_refresh_transaction_fence(parent, fixture.event.id)
     refund_id = System.unique_integer([:positive])
     line_id = System.unique_integer([:positive])
 
@@ -424,7 +424,7 @@ defmodule EventSales.Analytics.SourceWriterEventFenceConcurrencyTest do
       |> Map.put("date_modified_gmt", next_source_version(order.updated_at_source))
 
     parent = self()
-    holder = start_session_fence(parent, fixture.event.id)
+    holder = start_refresh_transaction_fence(parent, fixture.event.id)
 
     writer =
       Task.async(fn ->
@@ -489,7 +489,7 @@ defmodule EventSales.Analytics.SourceWriterEventFenceConcurrencyTest do
       Map.put(payload, "date_modified_gmt", next_source_version(order.updated_at_source))
 
     parent = self()
-    holder = start_session_fence(self(), fixture.event.id)
+    holder = start_refresh_transaction_fence(self(), fixture.event.id)
 
     try do
       task =
@@ -534,7 +534,7 @@ defmodule EventSales.Analytics.SourceWriterEventFenceConcurrencyTest do
       |> Map.put("date_modified_gmt", previous_source_version(order.updated_at_source))
 
     expected_source_version = order.updated_at_source
-    holder = start_session_fence(self(), fixture.event.id)
+    holder = start_refresh_transaction_fence(self(), fixture.event.id)
 
     try do
       equal_result =
@@ -624,7 +624,7 @@ defmodule EventSales.Analytics.SourceWriterEventFenceConcurrencyTest do
     fixture = create_attribution_fixture!() |> register_fixture_cleanup!()
     parent = self()
     event_ids = Enum.sort([fixture.old_event.id, fixture.new_event.id])
-    holders = Enum.map(event_ids, &start_session_fence(parent, &1))
+    holders = Enum.map(event_ids, &start_refresh_transaction_fence(parent, &1))
 
     correction =
       Task.async(fn ->
@@ -1126,14 +1126,14 @@ defmodule EventSales.Analytics.SourceWriterEventFenceConcurrencyTest do
     |> Map.put("number", "WRITER-#{System.unique_integer([:positive])}")
   end
 
-  defp start_session_fence(parent, event_id) do
-    task = Task.async(fn -> hold_session_fence(parent, event_id) end)
+  defp start_refresh_transaction_fence(parent, event_id) do
+    task = Task.async(fn -> hold_refresh_transaction_fence(parent, event_id) end)
 
     assert_receive {:held_event_fence, ^event_id, _holder_pid, backend_pid}, 5_000
     %{task: task, backend_pid: backend_pid, event_id: event_id}
   end
 
-  defp hold_session_fence(parent, event_id) do
+  defp hold_refresh_transaction_fence(parent, event_id) do
     UnboxedPostgres.with_connection(fn ->
       EventSnapshotRefreshFence.with_serial_event_refresh(event_id, fn ->
         send(
@@ -1194,7 +1194,7 @@ defmodule EventSales.Analytics.SourceWriterEventFenceConcurrencyTest do
          pre_commit_value
        ) do
     parent = self()
-    holder = start_session_fence(parent, event_id)
+    holder = start_refresh_transaction_fence(parent, event_id)
     task = Task.async(fn -> run_writer(parent, writer) end)
 
     assert_receive {:writer_backend, writer_backend}, 5_000
