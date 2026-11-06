@@ -344,3 +344,64 @@ jobs:
       - name: Verify EventSales V5 proof-bundle staging authority
         shell: bash
         run: bash test/scripts/agent_eventsales_v5_stage_proof_bundle_test.sh
+
+  ash_functions_v6_v7_proof:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CI: "true"
+      ASH_PROOF_EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      ASH_PROOF_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      ASH_PROOF_HOST: 127.0.0.1
+      ASH_PROOF_PORT: "55434"
+      ASH_PROOF_ADMIN_USER: postgres
+      ASH_PROOF_ADMIN_DATABASE: postgres
+    services:
+      proof_postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 55434:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Install Hex and Rebar
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+
+      - name: Fetch locked dependencies
+        run: mix deps.get --check-locked
+
+      - name: Run isolated Ash function proof
+        shell: bash
+        run: |
+          set -o pipefail
+          bash scripts/ci/ash_functions_v6_v7_proof.sh 2>&1 | tee "$RUNNER_TEMP/jc-361-ash-functions-v6-v7-proof.log"
+
+      - name: Preserve raw proof transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jc-361-ash-functions-v6-v7-proof-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/jc-361-ash-functions-v6-v7-proof.log
+          if-no-files-found: warn
+          retention-days: 7
