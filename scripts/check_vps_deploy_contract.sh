@@ -39,6 +39,8 @@ BOOTSTRAP_V2_WRAPPER="$ROOT/deploy/vps/operator/agent-eventsales-v3-bootstrap-po
 BOOTSTRAP_V2_SUDOERS="$ROOT/deploy/vps/operator/agent-eventsales-v3-bootstrap-postgres-v2.sudoers"
 V4_WRAPPER="$ROOT/deploy/vps/operator/agent-eventsales-v4-start-data-plane"
 V4_SUDOERS="$ROOT/deploy/vps/operator/agent-eventsales-v4-start-data-plane.sudoers"
+R5_AUDIT="$ROOT/deploy/vps/operator/agent-vps-d0-docker-audit"
+R5_SUDOERS="$ROOT/deploy/vps/operator/agent-vps-d0-docker-audit.sudoers"
 DEPLOY_PROBE_SCRIPTS=(
   "$ROOT/deploy/vps/data-plane/scripts/probe-postgres.sh"
   "$ROOT/deploy/vps/data-plane/scripts/probe-pgbouncer.sh"
@@ -69,6 +71,16 @@ for source_file in \
   "${DEPLOY_PROBE_SCRIPTS[@]}"; do
   [[ -f "$source_file" && -r "$source_file" ]] || fail SOURCE_FILE_MISSING
 done
+
+[[ -f "$R5_AUDIT" && -x "$R5_AUDIT" && ! -L "$R5_AUDIT" ]] || fail R5_AUDIT_TYPE
+[[ -f "$R5_SUDOERS" && ! -L "$R5_SUDOERS" ]] || fail R5_SUDOERS_TYPE
+IFS= read -r r5_shebang < "$R5_AUDIT" || fail R5_PRIVILEGED_BASH
+[[ "$r5_shebang" == '#!/bin/bash -p' ]] || fail R5_PRIVILEGED_BASH
+bash -n "$R5_AUDIT" || fail R5_AUDIT_SYNTAX
+expected_r5_rule='agentops ALL=(root) NOPASSWD: /usr/local/sbin/agent-vps-d0-docker-audit ""'
+[[ "$(cat -- "$R5_SUDOERS")" == "$expected_r5_rule" ]] || fail R5_SUDOERS_RULE
+[[ $(wc -l <"$R5_SUDOERS") -eq 1 ]] || fail R5_SUDOERS_SCOPE
+/usr/sbin/visudo -cf "$R5_SUDOERS" >/dev/null || fail R5_SUDOERS_SYNTAX
 
 [[ -x "$RECOVERY_WRAPPER" && ! -L "$RECOVERY_WRAPPER" ]] || fail RECOVERY_WRAPPER_TYPE
 bash -n "$RECOVERY_WRAPPER" || fail RECOVERY_WRAPPER_SYNTAX
