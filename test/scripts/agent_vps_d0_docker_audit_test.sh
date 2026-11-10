@@ -5,6 +5,10 @@ export LC_ALL=C
 repo_root=$(cd -- "$(dirname -- "$0")/../.." && pwd -P)
 python3 -I -S -B - "$repo_root" <<'PY'
 import fcntl
+import http.server
+import socketserver
+import threading
+import shutil
 import json
 import os
 import pathlib
@@ -159,6 +163,126 @@ class CollectorTests(unittest.TestCase):
                 self.assertEqual(report['COLLECTION_RESULT'], 'COMPLETE')
                 self.assertEqual(report['OPERATIONAL_CONTRACT'], 'MISMATCH')
                 self.fixture['containers'][self.ids[0]][field] = original
+
+    def test_effective_automatic_publication_is_mismatch(self):
+        self.fixture['containers'][self.ids[0]]['EffectivePorts'] = 1
+        code, report, _ = self.run_audit()
+        self.assertEqual(code, 0)
+        self.assertEqual(report['OPERATIONAL_CONTRACT'], 'MISMATCH')
+
+    def test_additional_postgres_mount_is_mismatch(self):
+        self.fixture['containers'][self.ids[0]]['ExtraMount'] = True
+        code, report, _ = self.run_audit()
+        self.assertEqual(code, 0)
+        self.assertEqual(report['OPERATIONAL_CONTRACT'], 'MISMATCH')
+
+    def test_real_docker_cli_templates(self):
+        # The real CLI evaluates the exact templates against a synthetic Engine API.
+        # No daemon, Docker socket, image, container or privileged operation is used.
+        docker = shutil.which('docker')
+        self.assertIsNotNone(docker, 'Docker CLI required for isolated template compatibility check')
+        module = types.ModuleType('template_collector')
+        source = WRAPPER.read_text().split("<<'PY'", 1)[1].rsplit('\nPY', 1)[0]
+        exec(compile(source, 'template-collector', 'exec'), module.__dict__)
+        payload = {}
+        requests = []
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+            def do_HEAD(self):
+                self.send_response(200)
+                self.send_header('API-Version', '1.47')
+                self.end_headers()
+            def do_GET(self):
+                requests.append(self.path)
+                if self.path.endswith('/json') and '/containers/' in self.path:
+                    data = json.dumps(payload).encode()
+                elif '/networks/' in self.path:
+                    data = json.dumps(dict(Id='a'*64, Name='fixture', Driver='bridge', Internal=True)).encode()
+                elif '/volumes/' in self.path:
+                    data = json.dumps(dict(Name='fixture', Driver='local', Scope='local')).encode()
+                elif '/containers/json' in self.path:
+                    data = json.dumps([dict(Id='a'*64, Names=['/eventsales-prod-postgres-1'],
+                                            Labels={'com.docker.compose.project':'eventsales-prod',
+                                                    'com.docker.compose.service':'postgres'})]).encode()
+                elif self.path.endswith('/version'):
+                    data = b'{"ApiVersion":"1.47","MinAPIVersion":"1.24"}'
+                elif self.path.endswith('/_ping'):
+                    data = b'OK'
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('API-Version', '1.47')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+        class Server(socketserver.UnixStreamServer):
+            pass
+        sock = str(self.base / 'engine.sock')
+        with Server(sock, Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                for cls in ('prod', 'd0'):
+                    for service in ('postgres', 'pgbouncer', 'redis'):
+                        network = module.DATA_NETWORK if cls == 'prod' else module.D0_NETWORK
+                        volume = module.PROD_VOLUME if cls == 'prod' else module.D0_VOLUME
+                        mounts = [dict(Type='volume', Name=volume, Destination='/var/lib/postgresql', RW=True),
+                                  dict(Type='bind', Source='/root/eventsales-prod/secrets-v1/postgres_bootstrap_password',
+                                       Destination='/run/secrets/postgres_bootstrap_password', RW=False)]
+                        payload.clear()
+                        payload.update(Id=self.ids[0], State=dict(Status='running', Health=dict(Status='healthy'), OOMKilled=False),
+                                       RestartCount=0, Config=dict(Image='fixture'),
+                                       HostConfig=dict(Memory=1, NanoCpus=1, PidsLimit=None, PortBindings={}),
+                                       NetworkSettings=dict(Networks={network:dict(NetworkID=self.data_id)}, Ports={'5432/tcp':None}),
+                                       Mounts=mounts)
+                        cases = [('baseline', '', True)]
+                        if cls == 'prod' and service == 'postgres':
+                            cases += [('effective', 'x', True), ('configured', 'x', True),
+                                      ('extra_mount', '', False), ('wrong_source', '', False),
+                                      ('writable_secret', '', False), ('missing_secret', '', False),
+                                      ('wrong_volume', '', False), ('duplicate_volume', '', False)]
+                        for case, ports, match in cases:
+                            with self.subTest(cls=cls, service=service, case=case):
+                                obj = json.loads(json.dumps(payload))
+                                if case == 'effective': obj['NetworkSettings']['Ports']['5432/tcp'] = [dict(HostIp='0.0.0.0', HostPort='49152')]
+                                if case == 'configured': obj['HostConfig']['PortBindings'] = {'5432/tcp':[dict(HostIp='', HostPort='5432')]}
+                                if case == 'extra_mount': obj['Mounts'].append(dict(Type='bind', Source='/fixture/unapproved', Destination='/extra', RW=True))
+                                if case == 'wrong_source': obj['Mounts'][1]['Source'] = '/fixture/wrong'
+                                if case == 'writable_secret': obj['Mounts'][1]['RW'] = True
+                                if case == 'missing_secret': obj['Mounts'].pop()
+                                if case == 'wrong_volume': obj['Mounts'][0]['Name'] = 'wrong'
+                                if case == 'duplicate_volume': obj['Mounts'][1] = obj['Mounts'][0]
+                                original = dict(payload)
+                                payload.clear(); payload.update(obj)
+                                result = subprocess.run([docker, '--host', 'unix://' + sock, 'inspect',
+                                                         '--format', module.container_format(cls, service), self.ids[0]],
+                                                        env={'PATH':'/usr/bin:/bin','HOME':str(self.base),'DOCKER_CONFIG':str(self.base / 'no-config')},
+                                                        capture_output=True, timeout=4)
+                                payload.clear(); payload.update(original)
+                                self.assertEqual(result.returncode, 0, 'real Docker CLI template failed')
+                                fields = result.stdout.decode().strip().split('|')
+                                self.assertEqual(len(fields), 13)
+                                self.assertEqual(fields[11], ports)
+                                self.assertEqual(json.loads(fields[12]), match)
+                for args, expected in [
+                    (['network','inspect','--format',module.NETWORK_FORMAT,'fixture'], 'a'*64+'|fixture|bridge|true'),
+                    (['volume','inspect','--format',module.VOLUME_FORMAT,'fixture'], 'fixture|local|local'),
+                    (['ps','-a','--no-trunc','--filter','name=^/?eventsales-(prod|d0-proof)-','--format',module.INVENTORY_FORMAT],
+                     'a'*64+'\teventsales-prod-postgres-1\teventsales-prod\tpostgres')]:
+                    result = subprocess.run([docker,'--host','unix://'+sock,*args],
+                                            env={'PATH':'/usr/bin:/bin','HOME':str(self.base),'DOCKER_CONFIG':str(self.base/'no-config')},
+                                            capture_output=True, timeout=4)
+                    self.assertEqual(result.returncode,0,'real Docker CLI metadata template failed')
+                    self.assertEqual(result.stdout.decode().strip(),expected)
+                self.assertTrue(requests)
+                self.assertTrue(all(any(part in x for part in ('/containers/','/networks/','/volumes/'))
+                                    or x.endswith(('/version','/_ping')) for x in requests))
+            finally:
+                server.shutdown()
+                thread.join(timeout=2)
 
     def test_inventory_absence_does_not_inspect_missing(self):
         self.fixture['inventory'] = '\n'.join(self.fixture['inventory'].splitlines()[1:]) + '\n'
@@ -503,7 +627,8 @@ elif args[2] == 'inspect':
                    ('ID', 'State', 'Health', 'RestartCount', 'OOMKilled', 'Image', 'Memory', 'NanoCPUs', 'PidsLimit')]
         expected_net = ('eventsales-prod' if args[-1][0] in '123' else 'eventsales-d0-proof') + '_eventsales_data'
         columns += [str(len(value['Networks'])), json.dumps(value['Networks'].get(expected_net, '')),
-                    'x' * value['PortBindings'], json.dumps(value['PostgresVolume'])]
+                    'x' * (value['PortBindings'] + (value.get('EffectivePorts', 0) if '.NetworkSettings.Ports' in args[-2] else 0)),
+                    json.dumps(value['PostgresVolume'] and not (value.get('ExtraMount', False) and 'len .Mounts' in args[-2]))]
         print('|'.join(columns))
 else:
     raise RuntimeError('forbidden fake Docker command')

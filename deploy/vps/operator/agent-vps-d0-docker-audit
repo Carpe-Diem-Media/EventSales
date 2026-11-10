@@ -300,12 +300,20 @@ def inventory():
 def container_format(cls, service):
     network = DATA_NETWORK if cls == 'prod' else D0_NETWORK
     volume = PROD_VOLUME if cls == 'prod' else D0_VOLUME
+    # Production PostgreSQL has exactly the data volume and read-only bootstrap bind.
+    # Archived D0 retains its historical volume-presence check, not mount attestation.
+    mount_check = ('{{$data := false}}{{$secret := false}}{{range .Mounts}}'
+                   '{{if and (eq .Type "volume") (eq .Name "' + volume + '") (eq .Destination "/var/lib/postgresql") .RW}}{{$data = true}}{{end}}'
+                   '{{if and (eq .Type "bind") (eq .Source "/root/eventsales-prod/secrets-v1/postgres_bootstrap_password") (eq .Destination "/run/secrets/postgres_bootstrap_password") (not .RW)}}{{$secret = true}}{{end}}'
+                   '{{end}}{{json (and (eq (len .Mounts) 2) $data $secret)}}') if cls == 'prod' else (
+                   '{{$found := false}}{{range .Mounts}}{{if and (eq .Type "volume") (eq .Name "' + volume + '") (eq .Destination "/var/lib/postgresql")}}{{$found = true}}{{end}}{{end}}{{json $found}}')
     fmt = ('{{json .Id}}|{{json .State.Status}}|{{if .State.Health}}{{json .State.Health.Status}}{{else}}"none"{{end}}|'
            '{{json .RestartCount}}|{{json .State.OOMKilled}}|{{json .Config.Image}}|{{json .HostConfig.Memory}}|'
            '{{json .HostConfig.NanoCpus}}|{{json .HostConfig.PidsLimit}}|{{len .NetworkSettings.Networks}}|'
            '{{with index .NetworkSettings.Networks "' + network + '"}}{{json .NetworkID}}{{else}}null{{end}}|'
-           '{{range $container, $bindings := .HostConfig.PortBindings}}{{range $bindings}}x{{end}}{{end}}|'
-           '{{if eq "' + service + '" "postgres"}}{{$found := false}}{{range .Mounts}}{{if and (eq .Type "volume") (eq .Name "' + volume + '") (eq .Destination "/var/lib/postgresql")}}{{$found = true}}{{end}}{{end}}{{json $found}}{{else}}true{{end}}')
+           '{{range $port, $bindings := .HostConfig.PortBindings}}{{range $bindings}}x{{end}}{{end}}'
+           '{{range $port, $bindings := .NetworkSettings.Ports}}{{range $bindings}}x{{end}}{{end}}|'
+           '{{if eq "' + service + '" "postgres"}}' + mount_check + '{{else}}true{{end}}')
     return fmt
 
 
@@ -417,7 +425,10 @@ def main():
                     report[prefix+'_NETWORK_COUNT'] = str(network_count)
                     report[prefix+'_NETWORK_ID'] = network_id if network_id else 'UNVERIFIED'
                     report[prefix+'_EXPECTED_NETWORKS_MATCH'] = 'YES' if network_count == 1 and network_id else 'NO'
+                    # Counts configured plus effective bindings; zero is the contract.
                     report[prefix+'_HOST_PORT_BINDINGS'] = str(binding_count)
+                    if service == 'postgres':
+                        report[prefix+'_MOUNT_ATTESTATION'] = ('MATCH' if volume_match else 'MISMATCH') if cls == 'prod' else 'UNVERIFIED'
                     report[prefix+'_VOLUME_MATCH'] = 'YES' if volume_match else 'NO'
                     state_match = report[prefix+'_STATE'] == expected[1]
                     running_rules = (report[prefix+'_HEALTH'] == 'healthy' if cls == 'prod' else True)
