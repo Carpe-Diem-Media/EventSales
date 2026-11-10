@@ -1,0 +1,537 @@
+#!/bin/bash -p
+set -euo pipefail
+set +x
+umask 077
+
+if (($# != 0)); then
+  exit 64 # Caller arguments forbidden; do not block on an unread diagnostic pipe.
+fi
+if ((EUID != 0)); then
+  exit 77 # Root required.
+fi
+cd / 2>/dev/null || exit 78
+
+exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/nonexistent DOCKER_CONFIG=/nonexistent/eventsales-audit-config DOCKER_HOST=unix:///var/run/docker.sock /usr/bin/python3 -I -S -B - <<'PY'
+import datetime
+import errno
+import json
+import os
+import re
+import selectors
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+DOCKER = '/usr/bin/docker'
+ROOT_UID = 0
+ROOT_GID = 0
+MARKER_ROOT = '/root/eventsales-prod'
+TRUSTED_ROOT = '/'
+PER_COMMAND_SECONDS = 3
+WORK_SECONDS = 35
+TOTAL_SECONDS = 40
+TERM_SECONDS = 1
+REAP_SECONDS = 1
+MAX_STDOUT = 4096
+MAX_STDERR = 1024
+MAX_RECORDS = 12
+MAX_RECORD_BYTES = 512
+MAX_COMMANDS = 10
+REPORT_MAX = 16 * 1024
+REPORT_END = 'REPORT_END=YES'
+DATA_NETWORK = 'eventsales-prod_eventsales_data'
+EDGE_NETWORK = 'eventsales-prod_eventsales_edge'
+D0_NETWORK = 'eventsales-d0-proof_eventsales_data'
+PROD_VOLUME = 'eventsales-prod_postgres_data'
+D0_VOLUME = 'eventsales-d0-proof_postgres_data'
+PROD_PROJECT = 'eventsales-prod'
+D0_PROJECT = 'eventsales-d0-proof'
+SERVICES = ('postgres', 'pgbouncer', 'redis')
+INVENTORY_FORMAT = '{{.ID}}\t{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.service"}}'
+NETWORK_FORMAT = '{{.Id}}|{{.Name}}|{{.Driver}}|{{.Internal}}'
+VOLUME_FORMAT = '{{.Name}}|{{.Driver}}|{{.Scope}}'
+MARKERS = ('.v3-postgres-recovery-consumed', '.v3-postgres-bootstrap-v2-consumed',
+           '.v4-pgbouncer-redis-start-consumed', '.v5-proof-bundle-stage-consumed')
+STAGES = ('c9ce0f9239123a6e58f66fde0b5a1e60238bb107', '2e7b848c7d89c7c0a8e3b0f7f81cd9ef6c7a36e6')
+EXPECTED = {
+    ('prod', 'postgres'): ('dhi.io/postgres:18.6-alpine3.24@sha256:d33bd884995daddfb515d0ce9aec23b74d20d72e03ca42b72c4abf617c76bb19', 'running', 3 * 1024**3, 2_000_000_000, 0),
+    ('prod', 'pgbouncer'): ('ghcr.io/jcschoeman96/eventsales-pgbouncer@sha256:965b0223f1096666471e11595f4f6dc5d32dfacbc688418b8ae2385946c41e3b', 'running', 128 * 1024**2, 500_000_000, 0),
+    ('prod', 'redis'): ('dhi.io/redis:8.10.2-debian13@sha256:953ca2c2ab4ff7a93f8abac31339ba4d913ec0914861453ab4faa29d154115a0', 'running', 512 * 1024**2, 500_000_000, 0),
+    ('d0', 'postgres'): ('dhi.io/postgres:18.6-alpine3.24@sha256:d33bd884995daddfb515d0ce9aec23b74d20d72e03ca42b72c4abf617c76bb19', 'exited', 3 * 1024**3, 2_000_000_000, 0),
+    ('d0', 'pgbouncer'): ('dhi.io/pgbouncer:1.26.1-debian13@sha256:78fe21ad5b7c1ab497e9828eea9b951f9d6a58eb638946ddc61ef1f99737f1b1', 'exited', 64 * 1024**2, 500_000_000, 0),
+    ('d0', 'redis'): ('dhi.io/redis:8.10.2-debian13@sha256:953ca2c2ab4ff7a93f8abac31339ba4d913ec0914861453ab4faa29d154115a0', 'exited', 512 * 1024**2, 500_000_000, 0),
+}
+cancelled = False
+deadline = 0.0
+work_deadline = 0.0
+command_count = 0
+
+
+class AuditError(Exception):
+    def __init__(self, code):
+        self.code = code
+
+
+def on_signal(_signum, _frame):
+    global cancelled
+    cancelled = True
+
+
+def remaining(limit):
+    left = min(limit, work_deadline - time.monotonic())
+    if cancelled:
+        raise AuditError('CANCELLED')
+    if left <= 0:
+        raise AuditError('TOTAL_DEADLINE')
+    return left
+
+
+def allowed_command(args):
+    if args == ['ps', '-a', '--no-trunc', '--filter',
+                'name=^/?eventsales-(prod|d0-proof)-', '--format', INVENTORY_FORMAT]:
+        return True
+    if len(args) == 5 and args[:3] == ['network', 'inspect', '--format']:
+        return args[3] == NETWORK_FORMAT and args[4] in (DATA_NETWORK, EDGE_NETWORK)
+    if args == ['volume', 'inspect', '--format', VOLUME_FORMAT, PROD_VOLUME]:
+        return True
+    if len(args) == 4 and args[:2] == ['inspect', '--format']:
+        return (re.fullmatch(r'[0-9a-f]{64}', args[3]) is not None
+                and args[2] in {container_format(cls, service)
+                                for cls in ('prod', 'd0') for service in SERVICES})
+    return False
+
+
+def run_docker(args):
+    global command_count
+    if not allowed_command(args):
+        raise AuditError('DOCKER_OPERATION_FORBIDDEN')
+    if command_count >= MAX_COMMANDS:
+        raise AuditError('DOCKER_COMMAND_LIMIT')
+    if remaining(PER_COMMAND_SECONDS) < PER_COMMAND_SECONDS:
+        raise AuditError('TOTAL_DEADLINE')
+    command_count += 1
+    command_deadline = min(work_deadline, time.monotonic() + PER_COMMAND_SECONDS)
+    try:
+        proc = subprocess.Popen(
+            [DOCKER, '--host', 'unix:///var/run/docker.sock', *args],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            close_fds=True, start_new_session=True, shell=False,
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C', 'HOME': '/nonexistent',
+                 'DOCKER_CONFIG': '/nonexistent/eventsales-audit-config',
+                 'DOCKER_HOST': 'unix:///var/run/docker.sock'})
+    except Exception:
+        raise AuditError('DOCKER_START_FAILED') from None
+
+    out, err = bytearray(), bytearray()
+    selector = None
+    try:
+        selector = selectors.DefaultSelector()
+        for stream, target, cap in ((proc.stdout, out, MAX_STDOUT),
+                                    (proc.stderr, err, MAX_STDERR)):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, (target, cap))
+        while selector.get_map():
+            remaining(PER_COMMAND_SECONDS)
+            wait = min(0.05, command_deadline - time.monotonic())
+            if wait <= 0:
+                raise AuditError('COMMAND_TIMEOUT')
+            for key, _ in selector.select(wait):
+                target, cap = key.data
+                chunk = os.read(key.fd, min(4096, cap + 1 - len(target)))
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                target.extend(chunk)
+                if len(target) > cap:
+                    raise AuditError('DOCKER_OUTPUT_LIMIT')
+        # Pipes may close before the child exits. The command deadline still applies.
+        left = command_deadline - time.monotonic()
+        if left <= 0:
+            raise AuditError('COMMAND_TIMEOUT')
+        try:
+            code = proc.wait(timeout=left)
+        except subprocess.TimeoutExpired:
+            raise AuditError('COMMAND_TIMEOUT') from None
+        try:
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AuditError('DOCKER_DESCENDANT_REMAINS')
+        if code != 0:
+            raise AuditError('DOCKER_COMMAND_FAILED')
+        return out.decode('utf-8', 'strict'), None
+    except BaseException as exc:
+        # This includes selector/pipe setup failures after Popen succeeded.
+        cleanup(proc)
+        if isinstance(exc, AuditError):
+            raise
+        raise AuditError('DOCKER_COLLECTION_FAILED') from None
+    finally:
+        if selector is not None:
+            selector.close()
+        proc.stdout.close()
+        proc.stderr.close()
+
+
+def cleanup(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        raise AuditError('CLEANUP_FAILED')
+    until = min(deadline, time.monotonic() + TERM_SECONDS)
+    while time.monotonic() < until:
+        try:
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(max(0, min(0.02, until-time.monotonic())))
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        raise AuditError('CLEANUP_FAILED')
+    try:
+        proc.wait(timeout=max(0.01, min(REAP_SECONDS, deadline-time.monotonic())))
+    except Exception:
+        raise AuditError('CLEANUP_UNRESOLVED')
+    try:
+        os.killpg(proc.pid, 0)
+    except ProcessLookupError:
+        return
+    except Exception:
+        raise AuditError('CLEANUP_FAILED')
+    raise AuditError('CLEANUP_UNRESOLVED')
+
+
+def integer(value):
+    return type(value) is int and 0 <= value <= (1 << 63) - 1
+
+
+def valid_pids_limit(value):
+    return value is None or (type(value) is int and -1 <= value <= (1 << 63) - 1)
+
+
+def diagnostic(code):
+    # A caller may stop reading stderr as well as stdout. Never block on diagnostics.
+    try:
+        os.set_blocking(2, False)
+        os.write(2, ('STOP=' + code + '\n').encode('ascii'))
+    except BaseException:
+        pass
+
+
+def metadata(path, expected_mode=0o700):
+    root = os.path.abspath(TRUSTED_ROOT)
+    target = os.path.abspath(path)
+    if os.path.commonpath((root, target)) != root:
+        return {'STATE': 'UNSAFE'}
+    parts = os.path.relpath(target, root).split(os.sep)
+    fd = None
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        ancestor = os.fstat(fd)
+        if ancestor.st_uid != ROOT_UID or ancestor.st_gid != ROOT_GID or ancestor.st_mode & 0o022:
+            return {'STATE': 'UNSAFE'}
+        for part in parts[:-1]:
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+            ancestor = os.fstat(fd)
+            if ancestor.st_uid != ROOT_UID or ancestor.st_gid != ROOT_GID or ancestor.st_mode & 0o022:
+                return {'STATE': 'UNSAFE'}
+        st = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+        if stat.S_ISLNK(st.st_mode):
+            return {'STATE': 'UNSAFE'}
+    except FileNotFoundError:
+        return {'EXISTS': 'NO', 'STATE': 'ABSENT'}
+    except OSError as exc:
+        return {'STATE': 'UNSAFE' if exc.errno in (errno.ELOOP, errno.ENOTDIR) else 'UNVERIFIED'}
+    finally:
+        if fd is not None:
+            os.close(fd)
+    kind = 'REGULAR' if stat.S_ISREG(st.st_mode) else 'DIRECTORY' if stat.S_ISDIR(st.st_mode) else 'OTHER'
+    mode = stat.S_IMODE(st.st_mode)
+    safe = kind == 'DIRECTORY' and st.st_uid == ROOT_UID and st.st_gid == ROOT_GID and mode == expected_mode
+    return {'EXISTS': 'YES', 'TYPE': kind, 'STATE': 'SAFE' if safe else 'UNSAFE',
+            'UID': str(st.st_uid), 'GID': str(st.st_gid), 'MODE': format(mode, '04o'),
+            'MTIME_UTC': datetime.datetime.fromtimestamp(st.st_mtime, datetime.timezone.utc).isoformat()}
+
+
+def inventory():
+    fmt = INVENTORY_FORMAT
+    out, _ = run_docker(['ps', '-a', '--no-trunc', '--filter', 'name=^/?eventsales-(prod|d0-proof)-', '--format', fmt])
+    rows = out.splitlines()
+    if len(rows) > MAX_RECORDS:
+        raise AuditError('INVENTORY_LIMIT')
+    found, unexpected = {}, 0
+    ids, names = set(), set()
+    for row in rows:
+        if len(row.encode()) > MAX_RECORD_BYTES:
+            raise AuditError('INVENTORY_RECORD_LIMIT')
+        columns = row.split('\t')
+        if len(columns) != 4:
+            raise AuditError('INVENTORY_INVALID')
+        ident, name, project, service = columns
+        if any(not re.fullmatch(r'[A-Za-z0-9_.-]{0,128}', label) for label in (project, service)):
+            raise AuditError('INVENTORY_LABEL_INVALID')
+        if not ident or not name or not re.fullmatch(r'[0-9a-f]{64}', ident) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', name) or ident in ids or name in names:
+            raise AuditError('INVENTORY_DUPLICATE')
+        ids.add(ident); names.add(name)
+        if project not in (PROD_PROJECT, D0_PROJECT) or service not in SERVICES:
+            unexpected += 1
+            continue
+        cls = 'prod' if project == PROD_PROJECT else 'd0'
+        if name != f'{project}-{service}-1':
+            unexpected += 1
+            continue
+        key = (cls, service)
+        if key in found:
+            raise AuditError('INVENTORY_DUPLICATE')
+        found[key] = ident
+    return found, unexpected
+
+
+def container_format(cls, service):
+    network = DATA_NETWORK if cls == 'prod' else D0_NETWORK
+    volume = PROD_VOLUME if cls == 'prod' else D0_VOLUME
+    fmt = ('{{json .Id}}|{{json .State.Status}}|{{if .State.Health}}{{json .State.Health.Status}}{{else}}"none"{{end}}|'
+           '{{json .RestartCount}}|{{json .State.OOMKilled}}|{{json .Config.Image}}|{{json .HostConfig.Memory}}|'
+           '{{json .HostConfig.NanoCpus}}|{{json .HostConfig.PidsLimit}}|{{len .NetworkSettings.Networks}}|'
+           '{{with index .NetworkSettings.Networks "' + network + '"}}{{json .NetworkID}}{{else}}null{{end}}|'
+           '{{range $container, $bindings := .HostConfig.PortBindings}}{{range $bindings}}x{{end}}{{end}}|'
+           '{{if eq "' + service + '" "postgres"}}{{$found := false}}{{range .Mounts}}{{if and (eq .Type "volume") (eq .Name "' + volume + '") (eq .Destination "/var/lib/postgresql")}}{{$found = true}}{{end}}{{end}}{{json $found}}{{else}}true{{end}}')
+    return fmt
+
+
+def inspect_container(ident, cls, service):
+    out, _ = run_docker(['inspect', '--format', container_format(cls, service), ident])
+    if len(out.encode()) > MAX_RECORD_BYTES:
+        raise AuditError('CONTAINER_RECORD_LIMIT')
+    fields = out.strip().split('|')
+    if len(fields) != 13:
+        raise AuditError('CONTAINER_FIELDS_INVALID')
+    if any(char != 'x' for char in fields[11]):
+        raise AuditError('CONTAINER_FIELDS_INVALID')
+    try:
+        ident_value, state, health, restarts, oom, image, memory, cpus, pids = [json.loads(v) for v in fields[:9]]
+        network_count, port_count = int(fields[9]), fields[11].count('x')
+        network_id = json.loads(fields[10]) if fields[10] != 'null' else ''
+    except Exception:
+        raise AuditError('CONTAINER_FIELDS_INVALID')
+    try:
+        volume_match = json.loads(fields[12])
+    except Exception:
+        raise AuditError('CONTAINER_FIELDS_INVALID')
+    if type(volume_match) is not bool:
+        raise AuditError('CONTAINER_FIELDS_INVALID')
+    return {'ID': ident_value, 'State': state, 'Health': health, 'RestartCount': restarts,
+            'OOMKilled': oom, 'Image': image, 'Memory': memory, 'NanoCPUs': cpus,
+            'PidsLimit': pids, 'NetworkCount': network_count, 'NetworkID': network_id,
+            'PortBindings': port_count, 'PostgresVolume': volume_match}
+
+
+def main():
+    global deadline, work_deadline, command_count, cancelled
+    command_count = 0
+    cancelled = False
+    now = time.monotonic()
+    deadline = now + TOTAL_SECONDS
+    work_deadline = now + WORK_SECONDS
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, on_signal)
+    report = {'SCHEMA_VERSION': '1', 'COLLECTION_RESULT': 'FAILED',
+              'OPERATIONAL_CONTRACT': 'UNVERIFIED', 'FAILURE_REASON': 'NONE',
+              'COLLECTION_ATOMIC': 'NO', 'INVENTORY_COVERAGE': 'FIXED_EVENTSALES_NAME_FILTER',
+              'OPERATIONAL_CONTRACT_SCOPE': 'FIXED_OBJECT_METADATA',
+              'IMAGE_CONTENT_ATTESTATION': 'UNVERIFIED', 'D0_HISTORICAL_CONTINUITY': 'UNVERIFIED',
+              'D0_NETWORK_OBJECT_ATTESTATION': 'UNVERIFIED',
+              'STAGED_BYTE_IDENTITY': 'UNVERIFIED', 'EXECUTION_RECORD_LOCATIONS': 'NOT_ESTABLISHED',
+              'V3_ACCEPTANCE': 'UNRESOLVED', 'V4_ACCEPTANCE': 'UNRESOLVED', 'V5_ACCEPTANCE': 'UNRESOLVED'}
+    try:
+        if os.geteuid() != ROOT_UID or os.getegid() != ROOT_GID:
+            raise AuditError('ROOT_REQUIRED')
+        cfg = '/nonexistent/eventsales-audit-config'
+        try:
+            os.lstat('/nonexistent')
+            raise AuditError('DOCKER_CONFIG_PATH_EXISTS')
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise AuditError('DOCKER_CONFIG_PATH_UNSAFE')
+        report['STARTED_AT_UTC'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        records, unexpected = inventory()
+        report['UNEXPECTED_MATCHING_CONTAINER_COUNT'] = str(unexpected)
+        statuses = ['MISMATCH'] if unexpected else []
+        for cls, project, network, volume in (('prod', PROD_PROJECT, DATA_NETWORK, PROD_VOLUME), ('d0', D0_PROJECT, D0_NETWORK, D0_VOLUME)):
+            for service in SERVICES:
+                prefix = f'{cls.upper()}_{service.upper()}'
+                ident = records.get((cls, service))
+                report[prefix+'_PRESENT'] = 'YES_AT_INVENTORY' if ident else 'NO_AT_INVENTORY'
+                report[prefix+'_QUERY_STATUS'] = 'NOT_ATTEMPTED'
+                expected = EXPECTED[(cls, service)]
+                report[prefix+'_EXPECTED_IMAGE'] = expected[0]
+                report[prefix+'_IMAGE_CONTENT_ATTESTATION'] = 'UNVERIFIED'
+                if not ident:
+                    report[prefix+'_CONTRACT'] = 'MISMATCH'
+                    statuses.append('MISMATCH')
+                    continue
+                report[prefix+'_ID'] = ident
+                try:
+                    obj = inspect_container(ident, cls, service)
+                    report[prefix+'_QUERY_STATUS'] = 'OK'
+                    fields = ('ID','State','Health','RestartCount','OOMKilled','Image','Memory','NanoCPUs','PidsLimit','NetworkCount','NetworkID','PortBindings','PostgresVolume')
+                    if any(field not in obj for field in fields):
+                        raise AuditError('CONTAINER_FIELDS_INVALID')
+                    if not isinstance(obj['ID'], str) or obj['ID'] != ident or not re.fullmatch(r'[0-9a-f]{64}', obj['ID']):
+                        raise AuditError('CONTAINER_ID_INVALID')
+                    state_value, health_value, image_value = obj['State'], obj['Health'], obj['Image']
+                    restart = obj['RestartCount']; oom = obj['OOMKilled']
+                    memory, cpus, pids = obj['Memory'], obj['NanoCPUs'], obj['PidsLimit']
+                    network_count, network_id, binding_count = obj['NetworkCount'], obj['NetworkID'], obj['PortBindings']
+                    volume_match = obj['PostgresVolume']
+                    if state_value not in ('created','running','paused','restarting','exited','dead','removing') or health_value not in ('healthy','unhealthy','starting','none'):
+                        raise AuditError('CONTAINER_ENUM_INVALID')
+                    if not isinstance(image_value, str) or len(image_value) > 256:
+                        raise AuditError('CONTAINER_IMAGE_INVALID')
+                    if not integer(restart) or type(oom) is not bool or not integer(memory) or not integer(cpus) or not valid_pids_limit(pids):
+                        raise AuditError('CONTAINER_NUMERIC_INVALID')
+                    if not integer(network_count) or not isinstance(network_id, str) or (network_id and not re.fullmatch(r'[0-9a-f]{64}', network_id)):
+                        raise AuditError('CONTAINER_NETWORKS_INVALID')
+                    if not integer(binding_count) or type(volume_match) is not bool:
+                        raise AuditError('CONTAINER_FIELDS_INVALID')
+                    report[prefix+'_STATE'] = state_value
+                    image_match = image_value == expected[0]
+                    report[prefix+'_IMAGE_REFERENCE_MATCH'] = 'YES' if image_match else 'NO'
+                    report[prefix+'_HEALTH'] = health_value
+                    report[prefix+'_RESTARTS'] = str(restart)
+                    report[prefix+'_OOM_KILLED'] = 'YES' if oom else 'NO'
+                    report[prefix+'_MEMORY_BYTES'] = str(memory)
+                    report[prefix+'_NANO_CPUS'] = str(cpus)
+                    report[prefix+'_PIDS_LIMIT'] = 'NOT_CONFIGURED' if pids is None or pids == 0 else 'UNLIMITED' if pids == -1 else str(pids)
+                    report[prefix+'_NETWORK_COUNT'] = str(network_count)
+                    report[prefix+'_NETWORK_ID'] = network_id if network_id else 'UNVERIFIED'
+                    report[prefix+'_EXPECTED_NETWORKS_MATCH'] = 'YES' if network_count == 1 and network_id else 'NO'
+                    report[prefix+'_HOST_PORT_BINDINGS'] = str(binding_count)
+                    report[prefix+'_VOLUME_MATCH'] = 'YES' if volume_match else 'NO'
+                    state_match = report[prefix+'_STATE'] == expected[1]
+                    running_rules = (report[prefix+'_HEALTH'] == 'healthy' if cls == 'prod' else True)
+                    pids_match = pids in (None, -1, 0)
+                    contract = state_match and image_match and restart == 0 and not oom and memory == expected[2] and cpus == expected[3] and pids_match and report[prefix+'_EXPECTED_NETWORKS_MATCH'] == 'YES' and binding_count == 0 and volume_match and running_rules
+                    report[prefix+'_CONTRACT'] = 'PASS' if contract else 'MISMATCH'
+                    statuses.append(report[prefix+'_CONTRACT'])
+                except AuditError:
+                    report[prefix+'_QUERY_STATUS'] = 'FAILED'
+                    report[prefix+'_PRESENT'] = 'UNVERIFIED'
+                    report[prefix+'_CONTRACT'] = 'UNVERIFIED'
+                    raise
+        production_network_ids = {}
+        for name, expected_driver, expected_internal in ((DATA_NETWORK,'bridge',True),(EDGE_NETWORK,'bridge',False)):
+            key = name.upper().replace('-', '_')
+            report[key+'_PRESENT'] = 'UNVERIFIED'
+            try:
+                out,_ = run_docker(['network','inspect','--format',NETWORK_FORMAT,name])
+                cols=out.strip().split('|')
+                if len(cols)!=4: raise AuditError('NETWORK_FIELDS_INVALID')
+                if not re.fullmatch(r'[0-9a-f]{64}', cols[0]) or cols[1] != name or cols[2] not in ('bridge','overlay','host','null') or cols[3] not in ('true','false'):
+                    raise AuditError('NETWORK_FIELDS_INVALID')
+                production_network_ids[name]=cols[0]
+                report[key+'_PRESENT']='YES_AT_INSPECT'
+                report[key+'_ID']=cols[0]
+                report[key+'_DRIVER_MATCH']='YES' if cols[2]==expected_driver else 'NO'
+                report[key+'_INTERNAL_MATCH']='YES' if cols[3]==str(expected_internal).lower() else 'NO'
+                report[key+'_NAME_MATCH']='YES'
+                statuses.append('PASS' if report[key+'_DRIVER_MATCH']=='YES' and report[key+'_INTERNAL_MATCH']=='YES' and report[key+'_NAME_MATCH']=='YES' else 'MISMATCH')
+            except AuditError:
+                report[key+'_QUERY_STATUS']='FAILED'; raise
+        for service in SERVICES:
+            prefix='PROD_'+service.upper()
+            attached=report.get(prefix+'_NETWORK_ID')
+            if attached != production_network_ids.get(DATA_NETWORK):
+                report[prefix+'_EXPECTED_NETWORKS_MATCH']='NO'
+                report[prefix+'_CONTRACT']='MISMATCH'
+                statuses.append('MISMATCH')
+        for name in (PROD_VOLUME,):
+            key=name.upper().replace('-','_')
+            report[key+'_PRESENT']='UNVERIFIED'
+            try:
+                out,_=run_docker(['volume','inspect','--format',VOLUME_FORMAT,name])
+                cols=out.strip().split('|')
+                if len(cols)!=3 or cols[0]!=name or cols[1] not in ('local','nfs','cifs') or cols[2] not in ('local','global'):
+                    raise AuditError('VOLUME_FIELDS_INVALID')
+                report[key+'_PRESENT']='YES_AT_INSPECT'; report[key+'_DRIVER']=cols[1]; report[key+'_SCOPE']=cols[2]
+                statuses.append('PASS' if cols[1]=='local' and cols[2]=='local' else 'MISMATCH')
+            except AuditError:
+                report[key+'_QUERY_STATUS']='FAILED'; raise
+        for marker in MARKERS:
+            info=metadata(os.path.join(MARKER_ROOT,marker))
+            for field,value in info.items(): report['MARKER_'+marker[1:].upper().replace('-','_')+'_'+field]=value
+        for stage in STAGES:
+            info=metadata(os.path.join(MARKER_ROOT,'staged',stage), 0o555)
+            for field,value in info.items(): report['STAGE_'+stage.upper()+'_'+field]=value
+        remaining(PER_COMMAND_SECONDS)
+        report['D0_OBSERVED_STATE']='ARCHIVED_STOPPED' if all(report.get('D0_'+s.upper()+'_STATE')=='exited' for s in SERVICES) else 'OTHER_OR_UNVERIFIED'
+        report['COLLECTION_RESULT']='COMPLETE'
+        report['OPERATIONAL_CONTRACT']='MISMATCH' if 'MISMATCH' in statuses else 'UNVERIFIED' if 'UNVERIFIED' in statuses else 'PASS'
+        report['FAILURE_REASON']='NONE'
+        report['EXIT_CODE']='0'
+    except AuditError as exc:
+        report['COLLECTION_RESULT']='BLOCKED' if exc.code in ('ROOT_REQUIRED','DOCKER_CONFIG_PATH_EXISTS','DOCKER_CONFIG_PATH_UNSAFE') else 'FAILED'
+        report['FAILURE_REASON']=exc.code
+        report['OPERATIONAL_CONTRACT']='UNVERIFIED'
+        report['EXIT_CODE']='1'
+    except BaseException:
+        report['COLLECTION_RESULT']='FAILED'; report['FAILURE_REASON']='INTERNAL_ERROR'
+        report['OPERATIONAL_CONTRACT']='UNVERIFIED'; report['EXIT_CODE']='1'
+    if cancelled and report['COLLECTION_RESULT'] == 'COMPLETE':
+        report['COLLECTION_RESULT'] = 'FAILED'
+        report['FAILURE_REASON'] = 'CANCELLED'
+        report['OPERATIONAL_CONTRACT'] = 'UNVERIFIED'
+        report['EXIT_CODE'] = '1'
+    report['FINISHED_AT_UTC']=datetime.datetime.now(datetime.timezone.utc).isoformat()
+    lines=[]
+    for key,value in report.items():
+        if not isinstance(key,str) or not key.replace('_','').isalnum() or not isinstance(value,(str,int)):
+            continue
+        value=str(value).replace('\n',' ').replace('\r',' ')
+        lines.append(f'{key}={value}')
+    lines.append(REPORT_END)
+    encoded=('\n'.join(lines)+'\n').encode()
+    if len(encoded)>REPORT_MAX or time.monotonic()>deadline:
+        diagnostic('REPORT_LIMIT')
+        return 1
+    try:
+        view=memoryview(encoded)
+        out_selector=selectors.DefaultSelector()
+        os.set_blocking(sys.stdout.fileno(), False)
+        out_selector.register(sys.stdout.fileno(), selectors.EVENT_WRITE)
+        while view:
+            if cancelled and report['COLLECTION_RESULT'] == 'COMPLETE':
+                raise OSError(errno.EINTR, 'cancelled')
+            left=deadline-time.monotonic()
+            if left<=0: raise OSError(errno.ETIMEDOUT,'deadline')
+            if not out_selector.select(min(left, 0.05)):
+                continue
+            written=os.write(sys.stdout.fileno(),view[:4096])
+            view=view[written:]
+        out_selector.close()
+    except Exception:
+        diagnostic('REPORT_WRITE_FAILED')
+        return 1
+    return int(report['EXIT_CODE'])
+
+
+if __name__ == '__main__':
+    try:
+        result = main()
+    except BaseException:
+        diagnostic('INTERNAL_ERROR')
+        result = 1
+    # All report bytes use os.write; do not invoke potentially blocking exit flushes.
+    os._exit(result)
+PY
