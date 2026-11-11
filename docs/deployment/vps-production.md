@@ -18,6 +18,8 @@ Resolve evidence in this order:
 
 If evidence at the applicable authority level cannot resolve a disagreement, stop with `STOP=AUTHORITY_CONFLICT`. Preserve the conflicting non-secret evidence and request a new decision. Do not resolve a conflict by relying on an operator report.
 
+The [existing-data-plane reconciliation draft](../superpowers/specs/2026-11-11-d1-existing-data-plane-readmission-ruling.md) proposes a separate route for pre-existing production objects. It is not accepted authority or permission to execute that route. Until an owner accepts an applicable decision, the V0 and V3 first-installation preconditions and STOP conditions below remain in force. Do not replay first-installation actions against existing objects. Historical V3–V5 acceptance remains unresolved, and V6 remains blocked until the required data-plane acceptance and separate authorization are established.
+
 `R1-RULING-01` locks the production release identity and discovery boundary:
 
 ```text
@@ -69,9 +71,9 @@ Every failed transition enters `BLOCKED_<TRANSITION>` and makes that authorizati
 
 ## Governance prerequisite for V0
 
-The repository has `scripts/check_vps_deploy_contract.sh` and CI runs the `vps_deploy_contract` job. That job is not currently a required Protect-main check. A separate, reviewed GitHub governance change and readback must make `vps_deploy_contract` required before V0. Exclude `wordpress_plugin_distribution` from that required-check decision. Do not mutate a ruleset as part of R5 or this runbook.
+The repository has `scripts/check_vps_deploy_contract.sh` and CI runs the `vps_deploy_contract` job. At the time of the R5 runbook, that job was not a required Protect-main check. Its current required-check status must be established by a fresh read-only GitHub governance readback before V0. If it is not required, a separate, reviewed GitHub governance change and readback must make it required before V0. Exclude `wordpress_plugin_distribution` from that required-check decision. Do not mutate a ruleset as part of R5 or this runbook.
 
-Until that change is separately reviewed and read back:
+Until the required-check status is independently verified, treat governance as pending. The following records the R5 state, not a claim about the current ruleset:
 
 ```text
 GOVERNANCE_HARDENING_PENDING=YES
