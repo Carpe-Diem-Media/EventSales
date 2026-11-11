@@ -22,7 +22,7 @@ Create a **separate, evidence-backed existing-data-plane re-admission route** be
 
 Authority order remains that in `docs/deployment/vps-production.md`: current accepted repository evidence at the exact reviewed commit/tree, `R1-RULING-01`, approved D1 architecture and implementation plan, accepted R3/R4 decisions, the runbook, and finally operator reports. An untracked operator report is dated evidence, **not authority**. No later chat summary, draft, agent opinion or uploaded copy can silently supersede a higher-level approved document.
 
-The report `docs/deployment/vps-agentops-status-2026-11-10.md` records (on 2026-11-10):
+The externally supplied operator report `vps-agentops-status-2026-11-10.md`, recorded on 2026-11-10, is untracked and is not included in this repository or PR. Its provenance is the reported restricted `agentops` read-only host inspection and follow-up described in the report. Before operational acceptance, preserve a suitably redacted copy with its source, collection date, integrity identity and separately approved evidence location so reviewers can inspect it. The report records:
 
 - `eventsales-prod-postgres-1`, `eventsales-prod-pgbouncer-1`, `eventsales-prod-redis-1` running, with no data-service host-published ports shown.
 - `eventsales-prod_eventsales_data` (internal), `eventsales-prod_eventsales_edge`, and `eventsales-prod_postgres_data` existing.
@@ -32,7 +32,7 @@ The report `docs/deployment/vps-agentops-status-2026-11-10.md` records (on 2026-
 - The `vps_deploy_contract` GitHub required check reportedly enabled at its 2026-11-10 live readback, contradicting the older tracked runbook wording. Recheck current live governance before reliance; do not treat an enabled required check as a passing check.
 - Existing EventSales PostgreSQL logical backup, encrypted off-host copy and disposable restore proof not established.
 
-All of the above are **dated observations**, not a claim about the VPS's present condition. Current runtime identity, health, restart counts, database grants/roles, PgBouncer behavior, Redis ACLs, one-shot markers, host Redis and D0 preservation remain unverified for re-admission. PR #356 was reported open at that inspection; current PR/CI/ruleset state requires independent verification before any merge recommendation.
+All of the above are **dated observations**, not a claim about the VPS's present condition. The accepted D0 closeout records healthy containers, while the later report says they were stopped. Reconcile that change with evidence explaining the transition and obtain owner review and acceptance of the current D0 baseline before functional eligibility or data-plane acceptance. Resolve any conflict with the approved D0 invariant through a separately reviewed owner authority decision; this draft does not supersede it. Missing or unexplained evidence blocks progression; this does not authorize a D0 action or revise the historical closeout. Current runtime identity, health, restart counts, database grants/roles, PgBouncer behavior, Redis ACLs, one-shot markers, host Redis and D0 preservation remain unverified for re-admission. PR #356 was reported open at that inspection; current PR/CI/ruleset state requires independent verification before any merge recommendation.
 
 ## 3. Explicit preservation rules
 
@@ -55,19 +55,19 @@ This is a **reconciliation/evidence lifecycle**, separate from the original firs
 | --- | --- | --- | --- | --- |
 | `AUTHORITY_RECONCILIATION_REQUIRED` | → `EXISTING_UNVERIFIED` | Owner accepts this narrow addendum after exact authority review | Documentary decision only; no VPS action | `BLOCKED_AUTHORITY` if documents conflict or evidence is insufficient to identify scope |
 | `EXISTING_UNVERIFIED` | → `CURRENT_STATE_OBSERVED` | Separate owner approval for bounded **read-only** host inventory; exact commands, credentials, evidence destination and redactions reviewed | Non-secret evidence capture only; no mutating commands or automatic repair | `BLOCKED_RECONCILIATION` on drift, unknown identity, missing evidence, secrets in output or any unexpected mutation |
-| `CURRENT_STATE_OBSERVED` | → `FUNCTIONAL_PROOF_ELIGIBLE` | Owner reviews exact current state, historical proof records, safe probes, one-shot markers, expected side effects and any independent acceptance requirements | Documentary eligibility decision only | `BLOCKED_PROOF_DESIGN` if the probe is unsafe, unclear, incompatible or would replay a consumed action |
+| `CURRENT_STATE_OBSERVED` | → `FUNCTIONAL_PROOF_ELIGIBLE` | Owner reviews exact current state, historical proof records, evidence explaining the D0 transition and the accepted current D0 baseline, safe probes, one-shot markers, expected side effects and any independent acceptance requirements | Documentary eligibility decision only | `BLOCKED_PROOF_DESIGN` if D0 evidence is missing or the probe is unsafe, unclear, incompatible or would replay a consumed action |
 | `FUNCTIONAL_PROOF_ELIGIBLE` | → `FUNCTIONAL_PROOF_RECORDED` | **New distinct** owner authorization for specifically listed functional proof operations using reviewed immutable bytes and bounded effects | Only approved test-object/key creation, if unavoidable; preserve artifacts | `BLOCKED_FUNCTIONAL_PROOF` at first failed check; no blind retry or cleanup |
 | `FUNCTIONAL_PROOF_RECORDED` | → `DATA_PLANE_ACCEPTED` | Independent owner review accepts the complete current PostgreSQL, PgBouncer, Redis, network, security, health/restart and D0/host-Redis continuity evidence | Acceptance record only | `BLOCKED_ACCEPTANCE` if any material test or identity is missing, inconsistent or failed |
 | `DATA_PLANE_ACCEPTED` | → V6 image review eligibility | V6's separate authority, source/digest and drift preconditions are independently satisfied | No automatic image approval, app staging, migration or public traffic | V6 remains blocked until specifically approved |
 
-A failure state is terminal **for the relevant authorization**; further work requires a newly reviewed scope and authorization. Read-only inspection can be designed to be repeatable, but existing one-shot grants are not implicitly renewed. A current-state acceptance may establish **present functional readiness** without rewriting a missing or failed historical V3, V4 or V5 verdict.
+A failure state is terminal **for the relevant authorization**; further work requires a newly reviewed scope and authorization. Read-only inspection can be designed to be repeatable, but existing one-shot grants are not implicitly renewed. Once this ruling is independently reviewed and accepted by the owner, V6 prior acceptance may be established either by accepted original V5 evidence or by independently accepted existing-state re-admission evidence. The latter must satisfy every V5 functional proof requirement and the reconciled D0 baseline without rewriting a missing or failed historical V3, V4 or V5 verdict. V6 remains blocked until its prerequisites and separate authorization are satisfied.
 
 ## 5. Minimal evidence contract
 
 The first authorized host action, if separately approved, should be a **bounded read-only inventory**, reusing an existing vetted read-only audit path where adequate. It must capture only the facts needed to determine the next transition:
 
 1. Exact live container IDs, immutable image digests, Compose project/service labels, health status, restart counts, network memberships, volume identity, port publications and resource limits.
-2. D0 container stopped state and unchanged identities; host Redis and OpenLiteSpeed/WordPress continuity, in scope without accessing user data.
+2. D0 identities and current state, evidence explaining the transition from the accepted healthy closeout to the later reported stopped state, and an owner-reviewed accepted current baseline for subsequent no-drift comparisons; host Redis and OpenLiteSpeed/WordPress continuity, in scope without accessing user data. Do not treat the reported stopped state as accepted without that decision.
 3. Privilege and wrapper installed-byte identities, version/checksum metadata, consumed-operation marker **metadata** where safe and authorized, not protected credential contents.
 4. Exact accepted Git source/tree and available accepted V3/V4/V5 evidence; current GitHub required-check status only through separately permitted read-only access.
 5. Clear PASS/FAIL/UNKNOWN classification against the approved topology, with timestamps, redacted evidence references and STOP reasons.
@@ -93,4 +93,4 @@ The next action is independent PR review of the exact diff, current CI and gover
 
 ---
 
-**Source basis:** `docs/deployment/vps-production.md` (runbook, including V0 and V3–V5); `docs/deployment/vps-agentops-status-2026-11-10.md` (dated host/operator report); the reported D1 approval and `R1-RULING-01` (must be read in-repo during integration); historical agent fixture result (blocked). No fresh VPS or GitHub verification was performed in preparing this draft.
+**Source basis:** `docs/deployment/vps-production.md` (runbook, including V0 and V3–V5); the externally supplied, untracked `vps-agentops-status-2026-11-10.md` (dated host/operator report); the D1 approval and `R1-RULING-01`; historical agent fixture result (blocked). No fresh VPS verification was performed in preparing this draft.
