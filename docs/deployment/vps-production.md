@@ -18,6 +18,8 @@ Resolve evidence in this order:
 
 If evidence at the applicable authority level cannot resolve a disagreement, stop with `STOP=AUTHORITY_CONFLICT`. Preserve the conflicting non-secret evidence and request a new decision. Do not resolve a conflict by relying on an operator report.
 
+The [existing-data-plane reconciliation draft](../superpowers/specs/2026-11-11-d1-existing-data-plane-readmission-ruling.md) proposes a separate route for pre-existing production objects. It is not accepted authority or permission to execute that route. Until an owner accepts an applicable decision, the V0 and V3 first-installation preconditions and STOP conditions below remain in force. Do not replay first-installation actions against existing objects. Historical V3–V5 acceptance remains unresolved, and V6 remains blocked until the required data-plane acceptance and separate authorization are established.
+
 `R1-RULING-01` locks the production release identity and discovery boundary:
 
 ```text
@@ -69,9 +71,9 @@ Every failed transition enters `BLOCKED_<TRANSITION>` and makes that authorizati
 
 ## Governance prerequisite for V0
 
-The repository has `scripts/check_vps_deploy_contract.sh` and CI runs the `vps_deploy_contract` job. That job is not currently a required Protect-main check. A separate, reviewed GitHub governance change and readback must make `vps_deploy_contract` required before V0. Exclude `wordpress_plugin_distribution` from that required-check decision. Do not mutate a ruleset as part of R5 or this runbook.
+The repository has `scripts/check_vps_deploy_contract.sh` and CI runs the `vps_deploy_contract` job. At the time of the R5 runbook, that job was not a required Protect-main check. Its current required-check status must be established by a fresh read-only GitHub governance readback before V0. If it is not required, a separate, reviewed GitHub governance change and readback must make it required before V0. Exclude `wordpress_plugin_distribution` from that required-check decision. Do not mutate a ruleset as part of R5 or this runbook.
 
-Until that change is separately reviewed and read back:
+Until the required-check status is independently verified, treat governance as pending. The following records the R5 state, not a claim about the current ruleset:
 
 ```text
 GOVERNANCE_HARDENING_PENDING=YES
@@ -160,7 +162,7 @@ Each gate below records its entering state, prior acceptance, authority, read-on
 ### D / V6: approve an immutable application image
 
 - **Entering state:** `DATA_PLANE_ACCEPTED`.
-- **Prior acceptance:** V5 proof is accepted; the exact source commit and tree are accepted; no data-plane, D0, or host Redis drift exists.
+- **Prior acceptance:** `DATA_PLANE_ACCEPTED` must be supported either by accepted original V5 proof or, only after the existing-data-plane reconciliation ruling is independently reviewed and accepted by the owner, by independently accepted existing-state re-admission evidence. The latter must satisfy all V5 functional proof requirements without changing historical V3–V5 records, and must include an owner-reviewed, accepted current D0 baseline with the transition from D0 closeout explained. The exact source commit and tree are accepted; no data-plane, D0, or host Redis drift exists against the applicable accepted baseline. V6 still requires its own authorization.
 - **Authority:** A separate V6 authorization is required to approve one published image digest. R5 selects no image and authorizes no application start.
 - **Read-only preflight and inputs:** Verify the accepted source SHA/tree, successful GitHub image-workflow run and GHCR publication, image source/revision/digest metadata, dependency closure, and provenance/SBOM when available. The only acceptable reference shape is `ghcr.io/jcschoeman96/eventsales@sha256:<64 lowercase hex characters>`. A mutable tag is never deployment authority.
 - **Permitted / forbidden:** Inspect the published artifact and record the exact digest under the V6 decision. Do not start or create an app, migration, bootstrap process, or ingress. Do not substitute a local verification tag or build source on the VPS.
@@ -172,7 +174,7 @@ Each gate below records its entering state, prior acceptance, authority, read-on
 ### E: stage the app bundle and protected runtime environment
 
 - **Entering state:** `IMAGE_APPROVED`.
-- **Prior acceptance:** V6 records one accepted immutable digest and source commit/tree. The safe node candidate was proven by V0's network audit; a node address is selected only under a separate reviewed decision.
+- **Prior acceptance:** V6 records one accepted immutable digest and source commit/tree. Before `EVENTSALES_NODE_IP` is selected, its candidate must be proven safe by either the accepted original V0 network-collision audit or, under the existing-state re-admission route after its ruling is accepted, a separately reviewed and accepted equivalent network-collision audit. A node address is selected only under a separate reviewed decision. Neither route authorizes host inspection or network changes automatically.
 - **Authority:** A separate E authorization permits staging the reviewed app Compose, ingress overlay, and protected runtime environment for later gates. E has no V number and does not authorize start, migration, bootstrap, or ingress.
 - **Read-only preflight and inputs:** Verify app files against the accepted commit/tree, exact approved image digest, root-owned target rules, protected environment source, and selected node-IP evidence. Require the container's `EVENTSALES_NODE_IP` to equal its `ipv4_address` on `eventsales-prod_eventsales_data`. Confirm `eventsales-app` is an alias only on the data network and absent from the edge network. Compose invocations must use `--env-file /dev/null`; `EVENTSALES_DEPLOY_ENV_FILE` must identify the protected runtime file through a separately approved path.
 - **Permitted / forbidden:** Stage reviewed bytes and the protected environment file without printing values. The overlay may be staged but not applied. Do not start/create the app, publish a host port, migrate, bootstrap, or attach the app to either network.
@@ -184,7 +186,7 @@ Each gate below records its entering state, prior acceptance, authority, read-on
 ### F / V7: run the one-shot migration
 
 - **Entering state:** `APP_STAGED`.
-- **Prior acceptance:** V5 data plane and V6 image are accepted; E staging is verified; the app is absent; no host app port exists; current backup/restore strategy and destructive migration risk have been reviewed.
+- **Prior acceptance:** `DATA_PLANE_ACCEPTED`, established through either V6 prior-acceptance route, and the V6 image are accepted; E staging is verified; the app is absent; no host app port exists; current backup/restore strategy and destructive migration risk have been reviewed.
 - **Authority:** A separate, one-shot V7 migration authorization is required. It identifies the exact digest, direct database target, migration operation, and backup/compatibility decision.
 - **Read-only preflight and inputs:** Confirm PostgreSQL is healthy and restart-free, `event_sales_prod` and `eventsales_migrator` match the accepted structural proof, the current backup/restore evidence is reviewed, the exact app digest is staged, and no app container or host port exists. The migration environment carries `DIRECT_DATABASE_URL` to PostgreSQL as `eventsales_migrator`. Runtime `DATABASE_URL` through PgBouncer is not migration authority.
 - **Permitted / forbidden:** Invoke only `EventSales.Release.migrate()` from the approved digest. Do not invoke bootstrap, normal app start, a combined migration/bootstrap operation, or a public/host-published container.
@@ -237,7 +239,7 @@ Each gate below records its entering state, prior acceptance, authority, read-on
 - **Read-only preflight and inputs:** Confirm probe identity, root wrapper, exact app/data-plane IDs, image digest, environment-name inventory, app and data-plane restart counts, D0 3/2/1 identity, host Redis baseline, and no host ports.
 - **Permitted / forbidden:** Run `probe-private.sh`; do not duplicate its proof logic. It must establish security/resources, private networks and node IP, data-only `eventsales-app` alias, forbidden-env absence, `Node.alive?`, `event_sales@EVENTSALES_NODE_IP`, PubSub, DNS resolution, BEAM/EPMD binds, `PrivateRuntimeSmoke`, private health/readiness, and data-plane/D0 stability. Do not add a host port or OLS route.
 - **Authority consumption / side effects:** V9 is consumed at the probe invocation. The accepted smoke may create bounded proof data through the approved runtime adapters; it may not restart or recreate any service.
-- **Success evidence / resulting state:** Preserve safe probe output and exact identities, with zero app/data-plane/D0 restarts and unchanged host Redis baseline. Result: `PRIVATE_ACCEPTED`.
+- **Success evidence / resulting state:** Preserve safe probe output and exact identities, with zero app/data-plane/D0 restarts during the proof and unchanged host Redis baseline. For the separately accepted existing-state route, compare D0 with its reviewed current baseline and preserve the explanation of its transition from closeout. Result: `PRIVATE_ACCEPTED`.
 - **STOP / failure evidence:** Stop on any probe failure, restart, wrong identity, forbidden env, wrong network/IP/alias, BEAM/EPMD bind mismatch, health/readiness failure, host port, D0 drift, or host Redis change. Preserve probe output, IDs, and resulting state.
 - **Rerun / rollback / next gate:** Failed V9 enters `BLOCKED_J`; no blind probe rerun or repair. A new review and authorization are required. Removing the private app or its data is not an automatic rollback. K/V10 remains unauthorized.
 
