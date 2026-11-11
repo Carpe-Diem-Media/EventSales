@@ -43,7 +43,7 @@ The following are protected and cannot be recreated, restarted, reset, deleted, 
 - Existing secrets and root-owned staged artifact identities; never read or print secret values or password verifiers.
 - Frozen D0 proof containers, networks and volume. **Do not start D0 merely to satisfy the first-installation runbook.**
 - Existing host Redis, OpenLiteSpeed/CyberPanel and WordPress workloads.
-- The `R1-RULING-01` node contract: `RELEASE_DISTRIBUTION=name`, node name `event_sales@EVENTSALES_NODE_IP`, DNS query `eventsales-app` only on `eventsales-prod_eventsales_data`, no edge-network alias. A future selected node IP must pass the approved collision audit and match the app's data-network `ipv4_address`.
+- The `R1-RULING-01` node contract: `RELEASE_DISTRIBUTION=name`, node name `event_sales@EVENTSALES_NODE_IP`, DNS query `eventsales-app` only on `eventsales-prod_eventsales_data`, no edge-network alias. Before selecting a node IP, the candidate must be proven safe by the accepted original V0 network-collision audit or a separately reviewed and accepted equivalent audit for the existing-state route. The selected IP must match the app's data-network `ipv4_address`. This draft selects no IP and authorizes no host inspection or network operation.
 
 Never run production data-volume removal or `docker compose down --volumes` as part of reconciliation. Do not interpret the existence of installed V3/V4/V5 wrappers as permission to replay them.
 
@@ -71,6 +71,8 @@ The first authorized host action, if separately approved, should be a **bounded 
 3. Privilege and wrapper installed-byte identities, version/checksum metadata, consumed-operation marker **metadata** where safe and authorized, not protected credential contents.
 4. Exact accepted Git source/tree and available accepted V3/V4/V5 evidence; current GitHub required-check status only through separately permitted read-only access.
 5. Clear PASS/FAIL/UNKNOWN classification against the approved topology, with timestamps, redacted evidence references and STOP reasons.
+
+Before any later node-IP selection, obtain and accept the applicable network-collision audit evidence above. An equivalent audit under the existing-state route requires separately reviewed scope and explicit authorization; this evidence requirement does not itself authorize the audit.
 
 Do not silently replace the canonical probes with custom ad hoc mutation. A fresh proof plan must say what it writes, what it cannot write, its maximum runtime/timeout, how it handles disconnects/container cleanup, and how failures leave evidence. The prior blocked lifecycle fixture report does **not** authorize executable proof or establish its safety; only resume that work if the approved proof design actually needs it.
 
