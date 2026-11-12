@@ -230,9 +230,8 @@ def main():
       record('MISMATCH'); postgres_mount='MISMATCH'
    elif volumes: record('MISMATCH')
    # Historical bind/tmpfs destination authority is not established in this candidate.
-   # Preserve such mounts without treating their presence as verified or printing them.
-   if any(x['Type'] in ('bind','tmpfs') for x in mounts):
-    record('UNVERIFIED'); report[service.upper()+'_ADDITIONAL_MOUNTS']='UNVERIFIED'
+   # The expected bind/tmpfs contract is unknown, including when none are observed.
+   record('UNVERIFIED'); report[service.upper()+'_ADDITIONAL_MOUNTS']='UNVERIFIED'
    key=service.upper(); report[key+'_ID']=ident; report[key+'_STATE']='exited'; report[key+'_RESTARTS']='0'; report[key+'_IMAGE_REFERENCE']='MATCH'; report[key+'_CONFIGURED_NETWORK']='MATCH'; report[key+'_ENDPOINT_ID']='MATCH' if nid else 'UNAVAILABLE_STOPPED'
   report['VOLUME_METADATA']='MATCH'; report['POSTGRES_VOLUME_ATTACHMENT']=postgres_mount; report['CURRENT_IDENTITY']=classification(); report['COLLECTION_RESULT']='COMPLETE'; code=0 if report['CURRENT_IDENTITY']=='MATCH' else 1
  except AuditError as e:

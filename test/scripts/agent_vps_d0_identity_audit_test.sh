@@ -186,7 +186,7 @@ class SecurityTests(unittest.TestCase):
     if mode.startswith('identity_version_'): self.assertEqual(self.server.requests,[b'GET /version HTTP/1.1'])
     self.assertTrue(all(item.startswith(b'GET ') for item in self.server.requests))
     if mode in ('identity','identity_no_endpoint','identity_known_data_member'):
-     self.assertEqual(code,0); self.assertIn(b'COLLECTION_RESULT=COMPLETE',output)
+     self.assertNotEqual(code,0); self.assertIn(b'CURRENT_IDENTITY=UNVERIFIED',output); self.assertIn(b'COLLECTION_RESULT=COMPLETE',output)
      self.assertIn(b'COLLECTION_ATOMIC=NO',output); self.assertIn(b'HISTORICAL_CONTINUITY=UNVERIFIED',output); self.assertIn(b'D0_CURRENT_BASELINE=NOT_ACCEPTED',output)
      if mode=='identity_no_endpoint': self.assertIn(b'POSTGRES_ENDPOINT_ID=UNAVAILABLE_STOPPED',output)
     else:
