@@ -1,0 +1,253 @@
+#!/bin/bash -p
+set -euo pipefail
+set +x
+umask 077
+
+if (($# != 0)); then
+  exit 64 # Caller arguments forbidden; do not block on an unread diagnostic pipe.
+fi
+if ((EUID != 0)); then
+  exit 77 # Root required.
+fi
+cd / 2>/dev/null || exit 78
+
+exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/nonexistent DOCKER_CONFIG=/nonexistent/eventsales-audit-config DOCKER_HOST=unix:///var/run/docker.sock /usr/bin/python3 -I -S -B - <<'PY'
+import http.client
+import io
+import json
+import os
+import re
+import socket
+import stat
+import struct
+import time
+import sys
+
+SOCKET_PATH = '/run/docker.sock'
+TRUSTED_PARENT = '/run'
+EXPECTED_SOCKET_UID = 0
+EXPECTED_PEER_UID = 0
+REQUEST_SECONDS = 3.0
+TOTAL_SECONDS = 40.0
+MAX_HEADER = 16384
+MAX_BODY = 262144
+API = '/v1.41'
+CONTAINERS_PATH = API + '/containers/json?all=1&filters=%7B%22label%22%3A%5B%22com.docker.compose.project%3Deventsales-d0-proof%22%5D%7D'
+PROJECT = 'eventsales-d0-proof'
+DATA = PROJECT + '_eventsales_data'
+EDGE = PROJECT + '_eventsales_edge'
+VOLUME = PROJECT + '_postgres_data'
+SERVICES = ('postgres', 'pgbouncer', 'redis')
+IMAGES = (
+ 'dhi.io/postgres:18.6-alpine3.24@sha256:d33bd884995daddfb515d0ce9aec23b74d20d72e03ca42b72c4abf617c76bb19',
+ 'dhi.io/pgbouncer:1.26.1-debian13@sha256:78fe21ad5b7c1ab497e9828eea9b951f9d6a58eb638946ddc61ef1f99737f1b1',
+ 'dhi.io/redis:8.10.2-debian13@sha256:953ca2c2ab4ff7a93f8abac31339ba4d913ec0914861453ab4faa29d154115a0')
+deadline = 0.0
+verified_ids = set()
+version_accepted = False
+request_count = 0
+MAX_REQUESTS = 8
+
+class AuditError(Exception):
+ pass
+
+def fail(code):
+ raise AuditError(code)
+
+def remaining(end):
+ left = min(end, deadline) - time.monotonic()
+ if left <= 0: fail('TIMEOUT')
+ return left
+
+def allowed(path):
+ if path == '/version': return True
+ if not version_accepted: return False
+ if path == CONTAINERS_PATH: return True
+ if path in (API+'/networks/'+DATA, API+'/networks/'+EDGE, API+'/volumes/'+VOLUME): return True
+ for ident in verified_ids:
+  if path == API+'/containers/'+ident+'/json': return True
+ return False
+
+class DeadlineReader(io.RawIOBase):
+ def __init__(self,sock,end):
+  self.sock=sock; self.end=end; self.count=0; self.header=True
+ def readable(self): return True
+ def readinto(self,buffer):
+  self.sock.settimeout(remaining(self.end))
+  limit=(MAX_HEADER if self.header else MAX_HEADER+MAX_BODY*4)
+  if self.count >= limit: fail('RESPONSE_LIMIT')
+  count=self.sock.recv_into(buffer,min(len(buffer),limit-self.count))
+  self.count+=count
+  return count
+
+class DeadlineSocket:
+ def __init__(self,sock,end): self.reader=DeadlineReader(sock,end)
+ def makefile(self,mode):
+  if mode!='rb': fail('INTERNAL')
+  return io.BufferedReader(self.reader,buffer_size=1024)
+
+def trusted_directory():
+ parent=os.path.dirname(SOCKET_PATH)
+ if parent != TRUSTED_PARENT or os.path.basename(SOCKET_PATH)!='docker.sock': fail('SOCKET_PATH')
+ for path,owner in (('/',0),(parent,EXPECTED_SOCKET_UID)):
+  entry=os.stat(path,follow_symlinks=False)
+  if not stat.S_ISDIR(entry.st_mode) or entry.st_uid!=owner or entry.st_mode & 0o022: fail('SOCKET_DIRECTORY')
+ return os.open(parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+
+def get_json(path):
+ global request_count
+ if not isinstance(path,str) or not allowed(path): fail('REQUEST_FORBIDDEN')
+ if request_count >= MAX_REQUESTS: fail('REQUEST_LIMIT')
+ request_count+=1
+ end=min(deadline,time.monotonic()+REQUEST_SECONDS)
+ sock=None; directory=None; response=None
+ try:
+  directory=trusted_directory()
+  before=os.stat('docker.sock',dir_fd=directory,follow_symlinks=False)
+  if not stat.S_ISSOCK(before.st_mode) or before.st_uid!=EXPECTED_SOCKET_UID or before.st_mode & 0o002: fail('SOCKET_IDENTITY')
+  sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+  sock.settimeout(remaining(end)); sock.connect('/proc/self/fd/'+str(directory)+'/docker.sock')
+  after=os.stat('docker.sock',dir_fd=directory,follow_symlinks=False)
+  if (before.st_dev,before.st_ino,before.st_uid,before.st_mode)!=(after.st_dev,after.st_ino,after.st_uid,after.st_mode): fail('SOCKET_IDENTITY')
+  peer=struct.unpack('3i',sock.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+  if peer[1]!=EXPECTED_PEER_UID: fail('SOCKET_IDENTITY')
+  sock.settimeout(remaining(end)); sock.sendall(('GET '+path+' HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\n\r\n').encode('ascii'))
+  wrapped=DeadlineSocket(sock,end)
+  response=http.client.HTTPResponse(wrapped); response.begin()
+  if response.status != 200: fail('HTTP_STATUS')
+  if response.headers.defects: fail('HEADER_INVALID')
+  lengths=response.headers.get_all('Content-Length',[]); encodings=response.headers.get_all('Transfer-Encoding',[])
+  if lengths and encodings: fail('HEADER_INVALID')
+  if len(lengths)>1 or len(encodings)>1: fail('HEADER_INVALID')
+  if lengths:
+   if not re.fullmatch(r'[0-9]{1,7}',lengths[0]): fail('HEADER_INVALID')
+   if int(lengths[0])>MAX_BODY: fail('BODY_LIMIT')
+  elif len(encodings)!=1 or encodings[0].lower()!='chunked': fail('HEADER_INVALID')
+  wrapped.reader.header=False
+  chunks=[]; total=0
+  while True:
+   piece=response.read(min(4096,MAX_BODY+1-total))
+   if not piece: break
+   total+=len(piece)
+   if total>MAX_BODY: fail('BODY_LIMIT')
+   chunks.append(piece)
+  if lengths and total!=int(lengths[0]): fail('INCOMPLETE')
+  remaining(end)
+  try: return json.loads(b''.join(chunks).decode('utf-8'))
+  except (ValueError,UnicodeError,RecursionError): fail('JSON_INVALID')
+ except AuditError: raise
+ except (OSError,TimeoutError,http.client.HTTPException,ValueError): fail('TRANSPORT')
+ finally:
+  if response is not None: response.close()
+  if sock is not None: sock.close()
+  if directory is not None: os.close(directory)
+
+def api_version(value):
+ if not isinstance(value,str) or not re.fullmatch(r'[0-9]{1,3}\.[0-9]{1,3}',value): fail('VERSION_INVALID')
+ return tuple(int(n) for n in value.split('.'))
+
+def check_version(obj):
+ if not isinstance(obj,dict): fail('VERSION_INVALID')
+ minimum=api_version(obj.get('MinAPIVersion')); maximum=api_version(obj.get('ApiVersion'))
+ if minimum>maximum: fail('VERSION_INVALID')
+ if not minimum <= (1,41) <= maximum: fail('VERSION_UNSUPPORTED')
+ return obj['MinAPIVersion'],obj['ApiVersion']
+
+def main():
+ global deadline,verified_ids,version_accepted,request_count
+ deadline=time.monotonic()+TOTAL_SECONDS; verified_ids=set(); version_accepted=False; request_count=0
+ report={'COLLECTION_RESULT':'INCOMPLETE','COLLECTION_ATOMIC':'NO','CURRENT_IDENTITY':'UNVERIFIED','HISTORICAL_CONTINUITY':'UNVERIFIED','D0_CURRENT_BASELINE':'NOT_ACCEPTED','IMAGE_CONTENT_IDENTITY':'UNVERIFIED','EDGE_HISTORICAL_NAME':'UNVERIFIED','VOLUME_IMMUTABLE_ID':'UNAVAILABLE'}
+ code=1
+ assertions=[]
+ def record(result):
+  assertions.append(result)
+ def classification():
+  if 'MISMATCH' in assertions: return 'MISMATCH'
+  if 'UNVERIFIED' in assertions: return 'UNVERIFIED'
+  return 'MATCH'
+ try:
+  minimum,maximum=check_version(get_json('/version'))
+  report['API_MIN_REPORTED']=minimum; report['API_MAX_REPORTED']=maximum; report['API_VERSION_SELECTED']='1.41'
+  version_accepted=True
+  rows=get_json(CONTAINERS_PATH)
+  if not isinstance(rows,list) or len(rows)!=3: fail('INVENTORY_MISMATCH')
+  found={}
+  for row in rows:
+   if not isinstance(row,dict): fail('INVENTORY_INVALID')
+   labels=row.get('Labels'); names=row.get('Names'); ident=row.get('Id')
+   if not isinstance(labels,dict) or not isinstance(names,list) or not isinstance(ident,str) or not re.fullmatch(r'[0-9a-f]{64}',ident): fail('INVENTORY_INVALID')
+   service=labels.get('com.docker.compose.service')
+   if labels.get('com.docker.compose.project')!=PROJECT or service not in SERVICES or names!=['/'+PROJECT+'-'+service+'-1'] or service in found or ident in found.values(): fail('INVENTORY_MISMATCH')
+   found[service]=ident
+  verified_ids=set(found.values())
+  network_ids={}
+  for name,logical,internal in ((DATA,'eventsales_data',True),(EDGE,'eventsales_edge',False)):
+   obj=get_json(API+'/networks/'+name)
+   if not isinstance(obj,dict) or not isinstance(obj.get('Labels'),dict): fail('NETWORK_INVALID')
+   ident=obj.get('Id'); labels=obj['Labels']
+   if not isinstance(ident,str) or not re.fullmatch(r'[0-9a-f]{64}',ident) or ident in network_ids.values() or obj.get('Name')!=name or obj.get('Driver')!='bridge' or obj.get('Internal') is not internal or labels.get('com.docker.compose.project')!=PROJECT or labels.get('com.docker.compose.network')!=logical: fail('NETWORK_MISMATCH')
+   members=obj.get('Containers')
+   if not isinstance(members,dict):
+    record('UNVERIFIED'); report['NETWORK_'+logical.upper()+'_ACTIVE_ENDPOINTS']='UNVERIFIED'; members={}
+   else:
+    report['NETWORK_'+logical.upper()+'_ACTIVE_ENDPOINTS']=str(len(members))
+   if name==EDGE and members: record('MISMATCH')
+   for member_id,member in members.items():
+    if not isinstance(member_id,str) or member_id not in found.values() or not isinstance(member,dict):
+     record('MISMATCH'); continue
+    service=next(s for s,i in found.items() if i==member_id)
+    if member.get('Name')!=PROJECT+'-'+service+'-1': record('MISMATCH')
+   network_ids[name]=ident; report['NETWORK_'+logical.upper()+'_ID']=ident
+  vol=get_json(API+'/volumes/'+VOLUME)
+  if not isinstance(vol,dict) or not isinstance(vol.get('Labels'),dict): fail('VOLUME_INVALID')
+  if vol.get('Name')!=VOLUME or vol.get('Driver')!='local' or vol.get('Scope')!='local' or vol['Labels'].get('com.docker.compose.project')!=PROJECT or vol['Labels'].get('com.docker.compose.volume')!='postgres_data': fail('VOLUME_MISMATCH')
+  mountpoint=vol.get('Mountpoint')
+  if not isinstance(mountpoint,str) or not mountpoint.startswith('/') or '\x00' in mountpoint:
+   record('UNVERIFIED'); mountpoint=None
+  postgres_mount='UNVERIFIED'
+  for service,image in zip(SERVICES,IMAGES):
+   ident=found[service]; obj=get_json(API+'/containers/'+ident+'/json')
+   if not isinstance(obj,dict) or not all(isinstance(obj.get(k),dict) for k in ('Config','State','NetworkSettings')): fail('CONTAINER_INVALID')
+   cfg=obj['Config']; state=obj['State']; nets=obj['NetworkSettings'].get('Networks'); labels=cfg.get('Labels')
+   if not isinstance(labels,dict) or not isinstance(nets,dict) or not isinstance(nets.get(DATA),dict): fail('CONTAINER_INVALID')
+   if type(state.get('Running')) is not bool or type(state.get('Restarting')) is not bool: record('UNVERIFIED')
+   nid=nets[DATA].get('NetworkID')
+   if obj.get('Id')!=ident or obj.get('Name')!='/'+PROJECT+'-'+service+'-1' or labels.get('com.docker.compose.project')!=PROJECT or labels.get('com.docker.compose.service')!=service or state.get('Status')!='exited' or state.get('Running') is True or state.get('Restarting') is True or type(obj.get('RestartCount')) is not int or obj['RestartCount']!=0 or cfg.get('Image')!=image or set(nets)!={DATA} or nid not in ('',None,network_ids[DATA]): fail('CONTAINER_MISMATCH')
+   mounts=obj.get('Mounts')
+   if not isinstance(mounts,list) or any(not isinstance(x,dict) or x.get('Type') not in ('volume','bind','tmpfs') for x in mounts):
+    record('UNVERIFIED'); report[service.upper()+'_MOUNTS']='UNVERIFIED'; continue
+   volumes=[x for x in mounts if x['Type']=='volume']
+   if service=='postgres':
+    if len(volumes)!=1 or volumes[0].get('Name')!=VOLUME or volumes[0].get('Destination')!='/var/lib/postgresql' or volumes[0].get('RW') is not True:
+     record('MISMATCH'); postgres_mount='MISMATCH'
+    else:
+     source=volumes[0].get('Source'); postgres_mount='MATCH'
+     if not isinstance(source,str) or not source.startswith('/') or '\x00' in source or mountpoint is None:
+      record('UNVERIFIED'); postgres_mount='UNVERIFIED'
+     elif source!=mountpoint:
+      record('MISMATCH'); postgres_mount='MISMATCH'
+     if 'Driver' in volumes[0] and volumes[0]['Driver']!=vol['Driver']:
+      record('MISMATCH'); postgres_mount='MISMATCH'
+   elif volumes: record('MISMATCH')
+   # Historical bind/tmpfs destination authority is not established in this candidate.
+   # The expected bind/tmpfs contract is unknown, including when none are observed.
+   record('UNVERIFIED'); report[service.upper()+'_ADDITIONAL_MOUNTS']='UNVERIFIED'
+   key=service.upper(); report[key+'_ID']=ident; report[key+'_STATE']='exited'; report[key+'_RESTARTS']='0'; report[key+'_IMAGE_REFERENCE']='MATCH'; report[key+'_CONFIGURED_NETWORK']='MATCH'; report[key+'_ENDPOINT_ID']='MATCH' if nid else 'UNAVAILABLE_STOPPED'
+  report['VOLUME_METADATA']='MATCH'; report['POSTGRES_VOLUME_ATTACHMENT']=postgres_mount; report['CURRENT_IDENTITY']=classification(); report['COLLECTION_RESULT']='COMPLETE'; code=0 if report['CURRENT_IDENTITY']=='MATCH' else 1
+ except AuditError as e:
+  report['STOP']='D0_'+str(e)
+  if str(e).endswith('MISMATCH'): record('MISMATCH')
+  if 'MISMATCH' in assertions: report['CURRENT_IDENTITY']='MISMATCH'
+ except BaseException:
+  report['STOP']='D0_INTERNAL_ERROR'
+  if 'MISMATCH' in assertions: report['CURRENT_IDENTITY']='MISMATCH'
+ report['REPORT_END']='YES'
+ output=''.join(k+'='+v+'\n' for k,v in report.items()).encode('ascii')
+ try:
+  os.set_blocking(1,False)
+  if os.write(1,output)!=len(output): return 1
+ except OSError: return 1
+ return code
+
+if __name__=='__main__': sys.exit(main())
+PY

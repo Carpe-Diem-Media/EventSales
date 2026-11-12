@@ -1,0 +1,1 @@
+agentops ALL=(root) NOPASSWD: /usr/local/sbin/agent-vps-d0-identity-audit ""

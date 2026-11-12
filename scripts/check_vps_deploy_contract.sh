@@ -41,6 +41,8 @@ V4_WRAPPER="$ROOT/deploy/vps/operator/agent-eventsales-v4-start-data-plane"
 V4_SUDOERS="$ROOT/deploy/vps/operator/agent-eventsales-v4-start-data-plane.sudoers"
 R5_AUDIT="$ROOT/deploy/vps/operator/agent-vps-d0-docker-audit"
 R5_SUDOERS="$ROOT/deploy/vps/operator/agent-vps-d0-docker-audit.sudoers"
+D0_IDENTITY_AUDIT="$ROOT/deploy/vps/operator/agent-vps-d0-identity-audit"
+D0_IDENTITY_SUDOERS="$ROOT/deploy/vps/operator/agent-vps-d0-identity-audit.sudoers"
 DEPLOY_PROBE_SCRIPTS=(
   "$ROOT/deploy/vps/data-plane/scripts/probe-postgres.sh"
   "$ROOT/deploy/vps/data-plane/scripts/probe-pgbouncer.sh"
@@ -81,6 +83,15 @@ expected_r5_rule='agentops ALL=(root) NOPASSWD: /usr/local/sbin/agent-vps-d0-doc
 [[ "$(cat -- "$R5_SUDOERS")" == "$expected_r5_rule" ]] || fail R5_SUDOERS_RULE
 [[ $(wc -l <"$R5_SUDOERS") -eq 1 ]] || fail R5_SUDOERS_SCOPE
 /usr/sbin/visudo -cf "$R5_SUDOERS" >/dev/null || fail R5_SUDOERS_SYNTAX
+
+[[ -f "$D0_IDENTITY_AUDIT" && -x "$D0_IDENTITY_AUDIT" && ! -L "$D0_IDENTITY_AUDIT" ]] || fail D0_IDENTITY_AUDIT_TYPE
+[[ -f "$D0_IDENTITY_SUDOERS" && ! -L "$D0_IDENTITY_SUDOERS" ]] || fail D0_IDENTITY_SUDOERS_TYPE
+IFS= read -r d0_identity_shebang < "$D0_IDENTITY_AUDIT" || fail D0_IDENTITY_SHEBANG
+[[ "$d0_identity_shebang" == '#!/bin/bash -p' ]] || fail D0_IDENTITY_SHEBANG
+bash -n "$D0_IDENTITY_AUDIT" || fail D0_IDENTITY_SYNTAX
+[[ "$(cat -- "$D0_IDENTITY_SUDOERS")" == 'agentops ALL=(root) NOPASSWD: /usr/local/sbin/agent-vps-d0-identity-audit ""' ]] || fail D0_IDENTITY_SUDOERS_RULE
+[[ $(wc -l <"$D0_IDENTITY_SUDOERS") -eq 1 ]] || fail D0_IDENTITY_SUDOERS_SCOPE
+/usr/sbin/visudo -cf "$D0_IDENTITY_SUDOERS" >/dev/null || fail D0_IDENTITY_SUDOERS_SYNTAX
 
 [[ -x "$RECOVERY_WRAPPER" && ! -L "$RECOVERY_WRAPPER" ]] || fail RECOVERY_WRAPPER_TYPE
 bash -n "$RECOVERY_WRAPPER" || fail RECOVERY_WRAPPER_SYNTAX
