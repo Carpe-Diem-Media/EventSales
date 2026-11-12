@@ -321,6 +321,10 @@ jobs:
         shell: bash
         run: bash test/scripts/agent_vps_d0_docker_audit_test.sh
 
+      - name: Verify D0 identity audit
+        shell: bash
+        run: bash test/scripts/agent_vps_d0_identity_audit_test.sh
+
       - name: Verify EventSales V3 privileged wrappers
         shell: bash
         run: bash test/scripts/agent_eventsales_v3_wrappers_test.sh
