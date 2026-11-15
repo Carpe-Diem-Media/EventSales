@@ -43,6 +43,7 @@ The collector report verifies expected `Config.Image` references. It does not in
 | Container stopped state and restart count | `AVAILABLE` | The collector checks `Status=exited` and zero restarts and reports both. | It does not prove the stop's authorization, time, or reason. |
 | Per-container `ExitCode` and `OOMKilled` | `UNAVAILABLE` | The collector does not read or report either field. | A new Docker observation requires separate authorization and would establish only its own observation time. |
 | Image reference | `AVAILABLE` | The collector compares `Config.Image` with the three pinned references and reports a match. | It does not establish image-content identity, which remains `UNVERIFIED`. |
+| Image-content identity | `UNAVAILABLE` | The collector does not inspect image content or record a content identity. | Keep `IMAGE_CONTENT_IDENTITY=UNVERIFIED`; a reference match is not content verification. |
 | Two network IDs and checked metadata | `AVAILABLE` | The collector records both IDs and checks names, drivers, internal flags, and labels. | Full IDs stay protected; one-date IDs do not prove historical continuity. |
 | Network membership | `PARTIALLY_AVAILABLE` | It checks configured data-network membership and records active endpoint counts when available. | Stopped-container endpoint IDs can be unavailable; historical membership is not established. |
 | Volume name and metadata | `AVAILABLE` | The collector checks the expected name, driver, scope, and labels. | A name match is not an immutable volume identity. |
