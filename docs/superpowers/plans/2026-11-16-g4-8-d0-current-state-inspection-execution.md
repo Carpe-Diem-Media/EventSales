@@ -110,16 +110,39 @@ sudo -- install -o root -g root -m 0600 /home/agentops/.eventsales-g4-8-upload/a
 sudo -- sha256sum /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once
 ```
 
-Only after both digests match, install the exact files. The commands refuse to replace existing target files because the preflight requires both paths to be absent:
+Only after both staging digests match, prepare root-owned temporary regular files in `/usr/local/sbin`. The absent-path checks below are diagnostic only. For each executable, `ln -T` publishes a same-filesystem hard link atomically and fails if the exact destination already exists, including when it is a symlink or directory. Do not use ordinary `install`, `cp`, or `mv` on either final path, and do not add `-f` to `ln`. Publication is atomic per file, not as a pair; the second publication can fail after the first succeeds.
 
 ```sh
-sudo -- install -o root -g root -m 0755 /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect /usr/local/sbin/agent-vps-d0-current-state-inspect
-sudo -- install -o root -g root -m 0755 /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once /usr/local/sbin/agent-vps-d0-current-state-once
-sudo -- stat -c '%U:%G %a %F %n' /usr/local/sbin/agent-vps-d0-current-state-inspect /usr/local/sbin/agent-vps-d0-current-state-once
+set -eu
+TMP_INSPECT="$(sudo -- mktemp /usr/local/sbin/.agent-vps-d0-current-state-inspect.g4-8.XXXXXX)"
+sudo -- stat -c '%U:%G %a %F %d:%i %n' "$TMP_INSPECT"
+TMP_ONCE="$(sudo -- mktemp /usr/local/sbin/.agent-vps-d0-current-state-once.g4-8.XXXXXX)"
+sudo -- stat -c '%U:%G %a %F %d:%i %n' "$TMP_ONCE"
+sudo -- test -f "$TMP_INSPECT"
+sudo -- test ! -L "$TMP_INSPECT"
+sudo -- test -f "$TMP_ONCE"
+sudo -- test ! -L "$TMP_ONCE"
+sudo -- cp -- /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect "$TMP_INSPECT"
+sudo -- cp -- /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once "$TMP_ONCE"
+sudo -- chown root:root "$TMP_INSPECT" "$TMP_ONCE"
+sudo -- stat -c '%U:%G %a %F %d:%i %n' "$TMP_INSPECT" "$TMP_ONCE"
+sudo -- sha256sum "$TMP_INSPECT" "$TMP_ONCE"
+```
+
+Record each temporary path and its device/inode (`%d:%i`) immediately after its exclusive `mktemp` creation. Require both temporary files to remain regular non-symlinks, `root:root`, mode `600`, and to match their pinned hashes. Only after both hashes match, make the verified files executable and publish them:
+
+```sh
+sudo -- chmod 0755 "$TMP_INSPECT" "$TMP_ONCE"
+sudo -- stat -c '%U:%G %a %F %d:%i %n' "$TMP_INSPECT" "$TMP_ONCE"
+sudo -- ln -T -- "$TMP_INSPECT" /usr/local/sbin/agent-vps-d0-current-state-inspect
+sudo -- ln -T -- "$TMP_ONCE" /usr/local/sbin/agent-vps-d0-current-state-once
+sudo -- stat -c '%U:%G %a %F %d:%i %n' "$TMP_INSPECT" /usr/local/sbin/agent-vps-d0-current-state-inspect "$TMP_ONCE" /usr/local/sbin/agent-vps-d0-current-state-once
 sudo -- sha256sum /usr/local/sbin/agent-vps-d0-current-state-inspect /usr/local/sbin/agent-vps-d0-current-state-once
 ```
 
-Require `root:root`, mode `755`, regular files, and exact table hashes. Do not proceed to `READ_AUTHORIZED` on any mismatch. No collector invocation occurs during staging or installation.
+Require each final path to be a regular non-symlink, `root:root`, mode `755`, with its pinned hash and the same device/inode as its corresponding recorded temporary path. If either `ln -T` fails, stop; do not try another publication command or execute either file. If the first final link was created but the second publication fails, remove the first final path only when it is still a regular non-symlink `root:root 0755` file, its hash matches the pinned collector digest, and its device/inode still matches `$TMP_INSPECT`. Then verify that exact path is absent. Never remove or alter the destination that caused `ln -T` to fail. If rollback succeeds, remove the two recorded temporary names only if each still has its recorded device/inode and remains a regular non-symlink `root:root` file; otherwise leave it and record `BLOCKED_INSTALL`. If any rollback condition is not met, leave paths untouched and record `BLOCKED_INSTALL`.
+
+If publication fails before any final link is made, remove only the temporary paths recorded from this attempt, and only when each remains a regular non-symlink `root:root` file with the same device/inode recorded immediately after its exclusive `mktemp` creation. After both final links pass verification, remove only the two recorded temporary link names and only after confirming each still shares a device/inode with its corresponding final file. A cleanup mismatch or failure is `BLOCKED_INSTALL`; preserve the remaining paths for an owner decision. Do not use a wildcard for temporary-file cleanup. Do not proceed to `READ_AUTHORIZED` on any publication, verification, or cleanup failure. No collector invocation occurs during staging or installation.
 
 ## One-time execution and capture
 
