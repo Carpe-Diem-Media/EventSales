@@ -1,0 +1,875 @@
+#!/bin/bash -p
+set -euo pipefail
+set +x
+umask 077
+
+if (($# != 0)); then
+  exit 64
+fi
+if ((EUID != 0)); then
+  exit 77
+fi
+cd / 2>/dev/null || exit 78
+
+exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/nonexistent DOCKER_CONFIG=/nonexistent/eventsales-d0-inspect-config DOCKER_HOST=unix:///run/docker.sock /usr/bin/python3 -I -S -B - <<'PY'
+import datetime
+import http.client
+import io
+import json
+import os
+import re
+import socket
+import stat
+import struct
+import sys
+import time
+
+SOCKET_PATH = "/run/docker.sock"
+TRUSTED_PARENT = "/run"
+EXPECTED_SOCKET_UID = 0
+EXPECTED_PEER_UID = 0
+REQUEST_SECONDS = 3.0
+TOTAL_SECONDS = 40.0
+MAX_HEADER_BYTES = 16384
+MAX_BODY_BYTES = 262144
+MAX_REPORT_BYTES = 65536
+API = "/v1.41"
+PROJECT = "eventsales-d0-proof"
+DATA = PROJECT + "_eventsales_data"
+EDGE = PROJECT + "_eventsales_edge"
+VOLUME = PROJECT + "_postgres_data"
+SERVICES = ("postgres", "pgbouncer", "redis")
+IMAGE_REFERENCES = {
+    "postgres": "dhi.io/postgres:18.6-alpine3.24@sha256:d33bd884995daddfb515d0ce9aec23b74d20d72e03ca42b72c4abf617c76bb19",
+    "pgbouncer": "dhi.io/pgbouncer:1.26.1-debian13@sha256:78fe21ad5b7c1ab497e9828eea9b951f9d6a58eb638946ddc61ef1f99737f1b1",
+    "redis": "dhi.io/redis:8.10.2-debian13@sha256:953ca2c2ab4ff7a93f8abac31339ba4d913ec0914861453ab4faa29d154115a0",
+}
+PROJECT_FILTER = "%7B%22label%22%3A%5B%22com.docker.compose.project%3Deventsales-d0-proof%22%5D%7D"
+CONTAINERS_PATH = API + "/containers/json?all=1&filters=" + PROJECT_FILTER
+NETWORKS_PATH = API + "/networks?filters=" + PROJECT_FILTER
+VOLUMES_PATH = API + "/volumes?filters=" + PROJECT_FILTER
+VOLUME_INSPECT_PATH = API + "/volumes/" + VOLUME
+MAX_REQUESTS = 15
+deadline = 0.0
+request_count = 0
+total_response_bytes = 0
+verified_ids = set()
+version_accepted = False
+
+
+class InspectError(Exception):
+    def __init__(self, code):
+        self.code = code
+
+
+def fail(code):
+    raise InspectError(code)
+
+
+def remaining(end):
+    left = min(end, deadline) - time.monotonic()
+    if left <= 0:
+        fail("TIMEOUT")
+    return left
+
+
+def allowed(path):
+    if path == "/version":
+        return True
+    if not version_accepted:
+        return False
+    if path in (CONTAINERS_PATH, NETWORKS_PATH, VOLUMES_PATH, VOLUME_INSPECT_PATH):
+        return True
+    for ident in verified_ids:
+        if path == API + "/containers/" + ident + "/json":
+            return True
+    return False
+
+
+class DeadlineReader(io.RawIOBase):
+    def __init__(self, sock, end):
+        self.sock = sock
+        self.end = end
+        self.count = 0
+        self.header = True
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self.sock.settimeout(remaining(self.end))
+        limit = MAX_HEADER_BYTES if self.header else MAX_BODY_BYTES
+        if self.count >= limit:
+            fail("RESPONSE_LIMIT")
+        amount = self.sock.recv_into(buffer, min(len(buffer), limit - self.count))
+        self.count += amount
+        return amount
+
+
+class DeadlineSocket:
+    def __init__(self, sock, end):
+        self.reader = DeadlineReader(sock, end)
+
+    def makefile(self, mode):
+        if mode != "rb":
+            fail("INTERNAL")
+        return io.BufferedReader(self.reader, buffer_size=1)
+
+
+def trusted_directory():
+    parent = os.path.dirname(SOCKET_PATH)
+    if parent != TRUSTED_PARENT or os.path.basename(SOCKET_PATH) != "docker.sock":
+        fail("SOCKET_PATH")
+    for path, owner in (("/", 0), (parent, EXPECTED_SOCKET_UID)):
+        entry = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISDIR(entry.st_mode) or entry.st_uid != owner or entry.st_mode & 0o022:
+            fail("SOCKET_DIRECTORY")
+    try:
+        return os.open(
+            parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError:
+        fail("SOCKET_DIRECTORY")
+
+
+def reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail("JSON_DUPLICATE_KEY")
+        result[key] = value
+    return result
+
+
+def reject_json_constant(_value):
+    fail("JSON_INVALID")
+
+
+def get_json(path):
+    global request_count, total_response_bytes
+    if not isinstance(path, str) or not allowed(path):
+        fail("REQUEST_FORBIDDEN")
+    if request_count >= MAX_REQUESTS:
+        fail("REQUEST_LIMIT")
+    request_count += 1
+    end = min(deadline, time.monotonic() + REQUEST_SECONDS)
+    sock = None
+    directory = None
+    response = None
+    try:
+        directory = trusted_directory()
+        before = os.stat("docker.sock", dir_fd=directory, follow_symlinks=False)
+        if (
+            not stat.S_ISSOCK(before.st_mode)
+            or before.st_uid != EXPECTED_SOCKET_UID
+            or before.st_mode & 0o002
+        ):
+            fail("SOCKET_IDENTITY")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(remaining(end))
+        sock.connect("/proc/self/fd/" + str(directory) + "/docker.sock")
+        after = os.stat("docker.sock", dir_fd=directory, follow_symlinks=False)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_uid,
+            before.st_mode,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_uid,
+            after.st_mode,
+        ):
+            fail("SOCKET_IDENTITY")
+        credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        if struct.unpack("3i", credentials)[1] != EXPECTED_PEER_UID:
+            fail("SOCKET_IDENTITY")
+        sock.settimeout(remaining(end))
+        request = (
+            "GET "
+            + path
+            + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
+        )
+        sock.sendall(request.encode("ascii"))
+        wrapped = DeadlineSocket(sock, end)
+        response = http.client.HTTPResponse(wrapped)
+        response.begin()
+        if response.status != 200:
+            fail("HTTP_STATUS")
+        if response.version != 11 or response.headers.defects:
+            fail("HEADER_INVALID")
+        lengths = response.headers.get_all("Content-Length", [])
+        encodings = response.headers.get_all("Transfer-Encoding", [])
+        content_types = response.headers.get_all("Content-Type", [])
+        if (
+            len(lengths) > 1
+            or len(encodings) > 1
+            or len(content_types) != 1
+            or lengths and encodings
+            or content_types[0].split(";", 1)[0].strip().lower() != "application/json"
+        ):
+            fail("HEADER_INVALID")
+        if lengths:
+            if not re.fullmatch(r"[0-9]{1,9}", lengths[0]):
+                fail("HEADER_INVALID")
+            expected_length = int(lengths[0])
+            if expected_length > MAX_BODY_BYTES:
+                fail("BODY_LIMIT")
+        elif len(encodings) == 1 and encodings[0].lower() == "chunked":
+            expected_length = None
+        else:
+            fail("HEADER_INVALID")
+        content_encodings = response.headers.get_all("Content-Encoding", [])
+        if len(content_encodings) > 1 or (
+            content_encodings and content_encodings[0].lower() != "identity"
+        ):
+            fail("HEADER_INVALID")
+        wrapped.reader.header = False
+        wrapped.reader.count = 0
+        chunks = []
+        body_length = 0
+        while True:
+            piece = response.read(min(4096, MAX_BODY_BYTES + 1 - body_length))
+            if not piece:
+                break
+            body_length += len(piece)
+            total_response_bytes += len(piece)
+            if body_length > MAX_BODY_BYTES or total_response_bytes > MAX_BODY_BYTES * MAX_REQUESTS:
+                fail("BODY_LIMIT")
+            chunks.append(piece)
+        if expected_length is not None and body_length != expected_length:
+            fail("INCOMPLETE")
+        remaining(end)
+        try:
+            return json.loads(
+                b"".join(chunks).decode("utf-8"),
+                object_pairs_hook=reject_duplicate_keys,
+                parse_constant=reject_json_constant,
+            )
+        except InspectError:
+            raise
+        except (ValueError, UnicodeError, RecursionError):
+            fail("JSON_INVALID")
+    except InspectError:
+        raise
+    except (OSError, TimeoutError, http.client.HTTPException, ValueError):
+        fail("TRANSPORT")
+    finally:
+        if response is not None:
+            response.close()
+        if sock is not None:
+            sock.close()
+        if directory is not None:
+            os.close(directory)
+
+
+def require_dict(value, code):
+    if not isinstance(value, dict):
+        fail(code)
+    return value
+
+
+def optional_dict(value, code):
+    if value is None:
+        return None
+    return require_dict(value, code)
+
+
+def require_list(value, code):
+    if not isinstance(value, list):
+        fail(code)
+    return value
+
+
+def require_string(value, code, allow_empty=False):
+    if not isinstance(value, str) or "\x00" in value or (not allow_empty and not value):
+        fail(code)
+    return value
+
+
+def require_bool(value, code):
+    if type(value) is not bool:
+        fail(code)
+    return value
+
+
+def require_int(value, code):
+    if type(value) is not int:
+        fail(code)
+    return value
+
+
+def require_map_keys(value, keys, code):
+    result = require_dict(value, code)
+    if any(key not in result for key in keys):
+        fail(code)
+    return result
+
+
+def docker_id(value, code):
+    ident = require_string(value, code)
+    if not re.fullmatch(r"[0-9a-f]{64}", ident):
+        fail(code)
+    return ident
+
+
+def safe_utc_now():
+    return (
+        datetime.datetime.now(datetime.timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def check_version(value):
+    obj = require_dict(value, "VERSION_INVALID")
+    minimum = require_string(obj.get("MinAPIVersion"), "VERSION_INVALID")
+    maximum = require_string(obj.get("ApiVersion"), "VERSION_INVALID")
+    if not re.fullmatch(r"[0-9]{1,3}\.[0-9]{1,3}", minimum):
+        fail("VERSION_INVALID")
+    if not re.fullmatch(r"[0-9]{1,3}\.[0-9]{1,3}", maximum):
+        fail("VERSION_INVALID")
+    min_parts = tuple(int(part) for part in minimum.split("."))
+    max_parts = tuple(int(part) for part in maximum.split("."))
+    selected = (1, 41)
+    if min_parts > max_parts:
+        fail("VERSION_INVALID")
+    if not min_parts <= selected <= max_parts:
+        fail("VERSION_UNSUPPORTED")
+
+
+def container_inventory(value):
+    rows = require_list(value, "CONTAINER_INVENTORY")
+    if len(rows) != len(SERVICES):
+        fail("CONTAINER_COUNT")
+    found = {}
+    for row in rows:
+        item = require_dict(row, "CONTAINER_INVENTORY")
+        ident = docker_id(item.get("Id"), "CONTAINER_ID")
+        names = require_list(item.get("Names"), "CONTAINER_NAME")
+        labels = require_dict(item.get("Labels"), "CONTAINER_LABELS")
+        service = require_string(
+            labels.get("com.docker.compose.service"),
+            "CONTAINER_LABELS",
+        )
+        expected_name = "/" + PROJECT + "-" + service + "-1"
+        if (
+            service not in SERVICES
+            or names != [expected_name]
+            or labels.get("com.docker.compose.project") != PROJECT
+            or service in found
+        ):
+            fail("CONTAINER_IDENTITY")
+        found[service] = ident
+    if set(found) != set(SERVICES) or len(set(found.values())) != len(SERVICES):
+        fail("CONTAINER_IDENTITY")
+    return {service: found[service] for service in SERVICES}
+
+
+def normalized_labels(labels, required, code):
+    values = require_dict(labels, code)
+    result = {}
+    for key in required:
+        result[key] = require_string(values.get(key), code)
+    return result
+
+
+def network_inventory(value, container_ids):
+    rows = require_list(value, "NETWORK_INVENTORY")
+    if len(rows) != 2:
+        fail("NETWORK_COUNT")
+    expected = {
+        DATA: ("eventsales_data", True),
+        EDGE: ("eventsales_edge", False),
+    }
+    results = {}
+    ids = set()
+    for raw in rows:
+        obj = require_dict(raw, "NETWORK_INVALID")
+        name = require_string(obj.get("Name"), "NETWORK_INVALID")
+        if name not in expected or name in results:
+            fail("NETWORK_IDENTITY")
+        logical_name, internal = expected[name]
+        ident = docker_id(obj.get("Id"), "NETWORK_ID")
+        if ident in ids:
+            fail("NETWORK_ID")
+        ids.add(ident)
+        labels = normalized_labels(
+            obj.get("Labels"),
+            ("com.docker.compose.project", "com.docker.compose.network"),
+            "NETWORK_LABELS",
+        )
+        if (
+            obj.get("Driver") != "bridge"
+            or require_bool(obj.get("Internal"), "NETWORK_INTERNAL") is not internal
+            or obj.get("Scope") != "local"
+            or labels != {
+                "com.docker.compose.project": PROJECT,
+                "com.docker.compose.network": logical_name,
+            }
+        ):
+            fail("NETWORK_CONTRACT")
+        require_string(obj.get("Created"), "NETWORK_CREATED")
+        options = optional_dict(obj.get("Options"), "NETWORK_OPTIONS")
+        ipam = require_dict(obj.get("IPAM"), "NETWORK_IPAM")
+        member_map = require_dict(obj.get("Containers"), "NETWORK_MEMBERSHIP")
+        members = []
+        for member_id, member_value in member_map.items():
+            ident_member = docker_id(member_id, "NETWORK_MEMBER")
+            if ident_member not in container_ids.values():
+                fail("NETWORK_MEMBER")
+            member = require_dict(member_value, "NETWORK_MEMBER")
+            name_value = require_string(member.get("Name"), "NETWORK_MEMBER")
+            endpoint_id = require_string(
+                member.get("EndpointID"),
+                "NETWORK_MEMBER",
+                allow_empty=True,
+            )
+            mac = require_string(
+                member.get("MacAddress"),
+                "NETWORK_MEMBER",
+                allow_empty=True,
+            )
+            ipv4 = require_string(
+                member.get("IPv4Address"),
+                "NETWORK_MEMBER",
+                allow_empty=True,
+            )
+            ipv6 = require_string(
+                member.get("IPv6Address"),
+                "NETWORK_MEMBER",
+                allow_empty=True,
+            )
+            service = next(key for key, value in container_ids.items() if value == ident_member)
+            if name_value != PROJECT + "-" + service + "-1":
+                fail("NETWORK_MEMBER")
+            members.append({
+                "id": ident_member,
+                "name": name_value,
+                "endpoint_id": endpoint_id,
+                "mac_address": mac,
+                "ipv4_address": ipv4,
+                "ipv6_address": ipv6,
+            })
+        results[name] = {
+            "id": ident,
+            "name": name,
+            "created": obj["Created"],
+            "scope": obj["Scope"],
+            "driver": obj["Driver"],
+            "internal": obj["Internal"],
+            "labels": labels,
+            "options": options,
+            "ipam": ipam,
+            "members": sorted(members, key=lambda member: member["id"]),
+        }
+    if set(results) != set(expected):
+        fail("NETWORK_IDENTITY")
+    return {name: results[name] for name in (DATA, EDGE)}
+
+
+def volume_summary(value):
+    obj = require_dict(value, "VOLUME_INVALID")
+    name = require_string(obj.get("Name"), "VOLUME_INVALID")
+    mountpoint = require_string(obj.get("Mountpoint"), "VOLUME_MOUNTPOINT")
+    if not mountpoint.startswith("/"):
+        fail("VOLUME_MOUNTPOINT")
+    labels = normalized_labels(
+        obj.get("Labels"),
+        ("com.docker.compose.project", "com.docker.compose.volume"),
+        "VOLUME_LABELS",
+    )
+    options = optional_dict(obj.get("Options"), "VOLUME_OPTIONS")
+    driver = require_string(obj.get("Driver"), "VOLUME_DRIVER")
+    scope = require_string(obj.get("Scope"), "VOLUME_SCOPE")
+    if (
+        name != VOLUME
+        or driver != "local"
+        or scope != "local"
+        or labels != {
+            "com.docker.compose.project": PROJECT,
+            "com.docker.compose.volume": "postgres_data",
+        }
+    ):
+        fail("VOLUME_CONTRACT")
+    return {
+        "name": name,
+        "driver": driver,
+        "scope": scope,
+        "mountpoint": mountpoint,
+        "labels": labels,
+        "options": options,
+    }
+
+
+def volume_inventory(value):
+    obj = require_dict(value, "VOLUME_INVENTORY")
+    warnings = require_list(obj.get("Warnings"), "VOLUME_WARNINGS")
+    if warnings:
+        fail("VOLUME_WARNINGS")
+    rows = require_list(obj.get("Volumes"), "VOLUME_INVENTORY")
+    if len(rows) != 1:
+        fail("VOLUME_COUNT")
+    return volume_summary(rows[0])
+
+
+def volume_inspection(value, listed):
+    obj = require_dict(value, "VOLUME_INVALID")
+    summary = volume_summary(obj)
+    created_at = require_string(obj.get("CreatedAt"), "VOLUME_CREATED")
+    status = obj.get("Status")
+    if status is not None:
+        status = require_dict(status, "VOLUME_STATUS")
+    if summary != listed:
+        fail("VOLUME_CHANGED_DURING_COLLECTION")
+    return {
+        **summary,
+        "created_at": created_at,
+        "status": status,
+    }
+
+
+def normalized_mount(value):
+    obj = require_map_keys(
+        value,
+        ("Type", "Name", "Source", "Destination", "Driver", "Mode", "RW", "Propagation"),
+        "MOUNT_INVALID",
+    )
+    mount_type = require_string(obj["Type"], "MOUNT_INVALID")
+    if mount_type not in ("volume", "bind", "tmpfs"):
+        fail("MOUNT_INVALID")
+    name = require_string(obj["Name"], "MOUNT_INVALID", allow_empty=True)
+    source = require_string(obj["Source"], "MOUNT_INVALID", allow_empty=True)
+    destination = require_string(obj["Destination"], "MOUNT_INVALID")
+    if not destination.startswith("/"):
+        fail("MOUNT_INVALID")
+    driver = require_string(obj["Driver"], "MOUNT_INVALID", allow_empty=True)
+    mode = require_string(obj["Mode"], "MOUNT_INVALID", allow_empty=True)
+    read_write = require_bool(obj["RW"], "MOUNT_INVALID")
+    propagation = require_string(obj["Propagation"], "MOUNT_INVALID", allow_empty=True)
+    return {
+        "type": mount_type,
+        "name": name,
+        "source": source,
+        "destination": destination,
+        "driver": driver,
+        "mode": mode,
+        "rw": read_write,
+        "propagation": propagation,
+    }
+
+
+def normalized_container(service, ident, value, networks, volume):
+    obj = require_dict(value, "CONTAINER_INVALID")
+    config = require_dict(obj.get("Config"), "CONTAINER_INVALID")
+    state = require_dict(obj.get("State"), "CONTAINER_INVALID")
+    host = require_dict(obj.get("HostConfig"), "CONTAINER_INVALID")
+    network_settings = require_dict(obj.get("NetworkSettings"), "CONTAINER_INVALID")
+    labels = normalized_labels(
+        config.get("Labels"),
+        ("com.docker.compose.project", "com.docker.compose.service"),
+        "CONTAINER_LABELS",
+    )
+    name = require_string(obj.get("Name"), "CONTAINER_NAME")
+    image_reference = require_string(config.get("Image"), "CONTAINER_IMAGE")
+    image_id = require_string(obj.get("Image"), "CONTAINER_IMAGE_ID")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        fail("CONTAINER_IMAGE_ID")
+    if (
+        docker_id(obj.get("Id"), "CONTAINER_ID") != ident
+        or name != "/" + PROJECT + "-" + service + "-1"
+        or labels != {
+            "com.docker.compose.project": PROJECT,
+            "com.docker.compose.service": service,
+        }
+        or image_reference != IMAGE_REFERENCES[service]
+    ):
+        fail("CONTAINER_IDENTITY")
+    status = require_string(state.get("Status"), "CONTAINER_STATE")
+    running = require_bool(state.get("Running"), "CONTAINER_STATE")
+    restarting = require_bool(state.get("Restarting"), "CONTAINER_STATE")
+    exit_code = require_int(state.get("ExitCode"), "CONTAINER_EXIT_CODE")
+    oom_killed = require_bool(state.get("OOMKilled"), "CONTAINER_OOM")
+    started_at = require_string(state.get("StartedAt"), "CONTAINER_STATE", allow_empty=True)
+    finished_at = require_string(state.get("FinishedAt"), "CONTAINER_STATE", allow_empty=True)
+    restart_count = require_int(obj.get("RestartCount"), "CONTAINER_RESTARTS")
+    restart_policy = require_dict(host.get("RestartPolicy"), "CONTAINER_RESTART_POLICY")
+    restart_policy_name = require_string(
+        restart_policy.get("Name"),
+        "CONTAINER_RESTART_POLICY",
+        allow_empty=True,
+    )
+    restart_policy_count = require_int(
+        restart_policy.get("MaximumRetryCount"),
+        "CONTAINER_RESTART_POLICY",
+    )
+
+    network_map = require_dict(network_settings.get("Networks"), "CONTAINER_NETWORKS")
+    if set(network_map) != {DATA}:
+        fail("CONTAINER_NETWORKS")
+    configured_network = require_dict(network_map.get(DATA), "CONTAINER_NETWORKS")
+    network_id = require_string(
+        configured_network.get("NetworkID"),
+        "CONTAINER_NETWORKS",
+        allow_empty=True,
+    )
+    endpoint_id = require_string(
+        configured_network.get("EndpointID"),
+        "CONTAINER_NETWORKS",
+        allow_empty=True,
+    )
+    if network_id and docker_id(network_id, "CONTAINER_NETWORKS") != networks[DATA]["id"]:
+        fail("CONTAINER_NETWORKS")
+    ip_address = require_string(
+        configured_network.get("IPAddress"),
+        "CONTAINER_NETWORKS",
+        allow_empty=True,
+    )
+    ipv6_address = require_string(
+        configured_network.get("GlobalIPv6Address"),
+        "CONTAINER_NETWORKS",
+        allow_empty=True,
+    )
+    mac_address = require_string(
+        configured_network.get("MacAddress"),
+        "CONTAINER_NETWORKS",
+        allow_empty=True,
+    )
+    aliases = require_list(configured_network.get("Aliases"), "CONTAINER_NETWORKS")
+    aliases = [require_string(alias, "CONTAINER_NETWORKS") for alias in aliases]
+
+    raw_mounts = require_list(obj.get("Mounts"), "CONTAINER_MOUNTS")
+    mounts = [normalized_mount(mount) for mount in raw_mounts]
+    destinations = [mount["destination"] for mount in mounts]
+    if len(destinations) != len(set(destinations)):
+        fail("CONTAINER_MOUNTS")
+    mounts = sorted(mounts, key=lambda mount: (
+        mount["destination"],
+        mount["type"],
+        mount["name"],
+        mount["source"],
+    ))
+    volume_mounts = [mount for mount in mounts if mount["type"] == "volume"]
+    postgres_attachment = None
+    if service == "postgres":
+        if len(volume_mounts) != 1:
+            fail("POSTGRES_VOLUME_ATTACHMENT")
+        attachment = volume_mounts[0]
+        if (
+            attachment["name"] != volume["name"]
+            or attachment["destination"] != "/var/lib/postgresql"
+            or attachment["rw"] is not True
+            or attachment["source"] != volume["mountpoint"]
+            or attachment["driver"] not in ("", volume["driver"])
+        ):
+            fail("POSTGRES_VOLUME_ATTACHMENT")
+        postgres_attachment = {
+            "volume_name": attachment["name"],
+            "source": attachment["source"],
+            "destination": attachment["destination"],
+            "driver": attachment["driver"] or volume["driver"],
+            "rw": attachment["rw"],
+            "mode": attachment["mode"],
+            "propagation": attachment["propagation"],
+        }
+    elif volume_mounts:
+        fail("UNEXPECTED_CONTAINER_VOLUME")
+
+    health = state.get("Health")
+    if health is not None:
+        health = require_dict(health, "CONTAINER_HEALTH")
+        health_status = require_string(
+            health.get("Status"),
+            "CONTAINER_HEALTH",
+            allow_empty=True,
+        )
+    else:
+        health_status = None
+
+    profile_match = (
+        status == "exited"
+        and running is False
+        and restarting is False
+        and exit_code == 0
+        and oom_killed is False
+        and restart_count == 0
+    )
+    return {
+        "id": ident,
+        "name": name,
+        "service": service,
+        "labels": labels,
+        "image_reference": image_reference,
+        "image_id": image_id,
+        "state": {
+            "status": status,
+            "running": running,
+            "restarting": restarting,
+            "exit_code": exit_code,
+            "oom_killed": oom_killed,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "health": health_status,
+        },
+        "restart_count": restart_count,
+        "restart_policy": {
+            "name": restart_policy_name,
+            "maximum_retry_count": restart_policy_count,
+            "classification": "RECORDED_NOT_INTERPRETED",
+        },
+        "configured_networks": {
+            DATA: {
+                "network_id": network_id,
+                "endpoint_id": endpoint_id,
+                "ip_address": ip_address,
+                "ipv6_address": ipv6_address,
+                "mac_address": mac_address,
+                "aliases": sorted(aliases),
+            },
+        },
+        "mounts": mounts,
+        "postgres_volume_attachment": postgres_attachment,
+        "stopped_state_match": profile_match,
+    }
+
+
+def collect_container_list():
+    return container_inventory(get_json(CONTAINERS_PATH))
+
+
+def collect_networks(container_ids):
+    return network_inventory(get_json(NETWORKS_PATH), container_ids)
+
+
+def collect_volume():
+    return volume_inventory(get_json(VOLUMES_PATH))
+
+
+def inspect_volume(listed):
+    return volume_inspection(get_json(VOLUME_INSPECT_PATH), listed)
+
+
+def inspect_containers(container_ids, networks, volume):
+    rows = []
+    for service in SERVICES:
+        ident = container_ids[service]
+        path = API + "/containers/" + ident + "/json"
+        rows.append(normalized_container(service, ident, get_json(path), networks, volume))
+    return rows
+
+
+def emit_failure(code):
+    safe_code = code if re.fullmatch(r"[A-Z0-9_]+", code) else "INTERNAL"
+    payload = ("D0_INSPECTION=INCOMPLETE STOP=" + safe_code + "\n").encode("ascii")
+    try:
+        os.set_blocking(1, False)
+        os.write(1, payload)
+    except OSError:
+        return 1
+    return 1
+
+
+def emit_report(report):
+    payload = (json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(payload) > MAX_REPORT_BYTES:
+        fail("REPORT_LIMIT")
+    try:
+        os.set_blocking(1, False)
+        return 0 if os.write(1, payload) == len(payload) else 1
+    except OSError:
+        return 1
+
+
+def main():
+    global deadline, request_count, total_response_bytes, verified_ids, version_accepted
+    started_at = safe_utc_now()
+    deadline = time.monotonic() + TOTAL_SECONDS
+    request_count = 0
+    total_response_bytes = 0
+    verified_ids = set()
+    version_accepted = False
+    try:
+        check_version(get_json("/version"))
+        version_accepted = True
+
+        containers_before = collect_container_list()
+        verified_ids = set(containers_before.values())
+        networks_before = collect_networks(containers_before)
+        volume_list_before = collect_volume()
+        volume_before = inspect_volume(volume_list_before)
+        containers_detail_before = inspect_containers(
+            containers_before,
+            networks_before,
+            volume_before,
+        )
+
+        containers_after = collect_container_list()
+        if containers_after != containers_before:
+            fail("CONTAINER_INVENTORY_CHANGED")
+        networks_after = collect_networks(containers_after)
+        if networks_after != networks_before:
+            fail("NETWORKS_CHANGED")
+        volume_list_after = collect_volume()
+        if volume_list_after != volume_list_before:
+            fail("VOLUME_LIST_CHANGED")
+        volume_after = inspect_volume(volume_list_after)
+        if volume_after != volume_before:
+            fail("VOLUME_CHANGED_DURING_COLLECTION")
+        containers_detail_after = inspect_containers(
+            containers_after,
+            networks_after,
+            volume_after,
+        )
+        if containers_detail_after != containers_detail_before:
+            fail("CONTAINER_STATE_OR_MOUNTS_CHANGED")
+
+        containers = containers_detail_after
+        all_containers_stopped_state_match = all(
+            container["stopped_state_match"] for container in containers
+        )
+        report = {
+            "schema": "eventsales.d0.current-state-inspection.v1",
+            "collection_result": "COMPLETE",
+            "collection_atomic": "NO",
+            "acquisition_consistency": "TWO_OBSERVATIONS_MATCH",
+            "started_at_utc": started_at,
+            "finished_at_utc": safe_utc_now(),
+            "historical_continuity": "UNVERIFIED",
+            "d0_historical_transition": "UNVERIFIED",
+            "d0_current_baseline": "NOT_ACCEPTED",
+            "image_content_identity": "DOCKER_REPORTED_IMAGE_ID_ONLY",
+            "volume_immutable_id": "UNAVAILABLE",
+            "mount_expectations": "UNVERIFIED",
+            "all_containers_stopped_state_match": all_containers_stopped_state_match,
+            "request_count": request_count,
+            "request_limit": MAX_REQUESTS,
+            "response_body_limit_bytes": MAX_BODY_BYTES,
+            "limitations": [
+                "The two matching observations are sequential Docker API reads, not an atomic snapshot.",
+                "This report cannot establish the authorization, operator, time, reason, or object continuity of the historical D0 stop.",
+                "Docker-reported image IDs are recorded without independent image-content verification.",
+                "Docker volumes have no immutable ID in this evidence contract; CreatedAt and mountpoint are recorded metadata, not an immutable ID.",
+                "Observed additional mounts are recorded but are not validated against an unavailable historical mount contract.",
+                "The stopped-state match covers only status, running, restarting, exit code, OOMKilled, and restart count; it is not a full baseline comparison.",
+                "This inspection does not accept a baseline, authorize a preservation exception, establish functional-proof eligibility, or authorize V9/V10.",
+            ],
+            "objects": {
+                "containers": containers,
+                "networks": list(networks_after.values()),
+                "volumes": [volume_after],
+            },
+        }
+        write_status = emit_report(report)
+        if write_status != 0:
+            return 1
+        return 0 if all_containers_stopped_state_match else 1
+    except InspectError as error:
+        return emit_failure(error.code)
+    except Exception:
+        return emit_failure("INTERNAL")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PY
