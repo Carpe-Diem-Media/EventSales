@@ -14,6 +14,7 @@ cd / 2>/dev/null || exit 78
 exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/nonexistent DOCKER_CONFIG=/nonexistent/eventsales-d0-inspect-config DOCKER_HOST=unix:///run/docker.sock /usr/bin/python3 -I -S -B - <<'PY'
 import datetime
 import http.client
+import ipaddress
 import io
 import json
 import os
@@ -305,6 +306,32 @@ def require_int(value, code):
     return value
 
 
+def normalized_network_address(value, family):
+    if family == "mac":
+        normalized = value.lower()
+        if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", normalized):
+            fail("NETWORK_ADDRESS_INVALID")
+        return normalized
+    try:
+        address = ipaddress.ip_interface(value).ip
+    except ValueError:
+        fail("NETWORK_ADDRESS_INVALID")
+    expected_version = 4 if family == "ipv4" else 6
+    if address.version != expected_version:
+        fail("NETWORK_ADDRESS_INVALID")
+    return str(address)
+
+
+def compare_network_address(observed, configured, family):
+    observed_value = normalized_network_address(observed, family) if observed else None
+    configured_value = normalized_network_address(configured, family) if configured else None
+    if observed_value is None or configured_value is None:
+        return "UNAVAILABLE"
+    if observed_value != configured_value:
+        fail("NETWORK_ADDRESS_MISMATCH")
+    return "MATCH"
+
+
 def require_map_keys(value, keys, code):
     result = require_dict(value, code)
     if any(key not in result for key in keys):
@@ -545,9 +572,23 @@ def reconcile_network_membership(networks, containers):
             else:
                 endpoint_status = "UNAVAILABLE"
                 partial_cross_check = True
+            address_statuses = {
+                "mac_address": compare_network_address(
+                    member["mac_address"], configured["mac_address"], "mac"
+                ),
+                "ipv4_address": compare_network_address(
+                    member["ipv4_address"], configured["ip_address"], "ipv4"
+                ),
+                "ipv6_address": compare_network_address(
+                    member["ipv6_address"], configured["ipv6_address"], "ipv6"
+                ),
+            }
+            if any(status == "UNAVAILABLE" for status in address_statuses.values()):
+                partial_cross_check = True
             member["cross_check"] = {
                 "network_id": network_status,
                 "endpoint_id": endpoint_status,
+                **address_statuses,
             }
             members.append(member)
             member_ids.add(member["id"])
@@ -776,8 +817,14 @@ def normalized_container(service, ident, value, networks, volume):
         "CONTAINER_NETWORKS",
         allow_empty=True,
     )
-    aliases = require_list(configured_network.get("Aliases"), "CONTAINER_NETWORKS")
-    aliases = [require_string(alias, "CONTAINER_NETWORKS") for alias in aliases]
+    raw_aliases = configured_network.get("Aliases")
+    if raw_aliases is None:
+        aliases = None
+        aliases_status = "UNAVAILABLE"
+    else:
+        aliases = require_list(raw_aliases, "CONTAINER_NETWORKS")
+        aliases = sorted(require_string(alias, "CONTAINER_NETWORKS") for alias in aliases)
+        aliases_status = "OBSERVED"
     network_configuration_status = (
         "OBSERVED" if network_id and endpoint_id else "PARTIALLY_AVAILABLE"
     )
@@ -790,7 +837,8 @@ def normalized_container(service, ident, value, networks, volume):
             "ip_address": ip_address,
             "ipv6_address": ipv6_address,
             "mac_address": mac_address,
-            "aliases": sorted(aliases),
+            "aliases": aliases,
+            "aliases_status": aliases_status,
         },
     }
 

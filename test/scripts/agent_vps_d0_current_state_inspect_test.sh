@@ -107,16 +107,18 @@ def volume_inspect():
 
 
 def network_attachment(service, mode):
+    index = {"postgres": 2, "pgbouncer": 3, "redis": 4}[service]
     endpoint_id = (
         ENDPOINT_IDS[service]
         if mode in ("cross_checked_membership", "wrong_network_endpoint")
+        or mode in ("missing_container_network_addresses", "conflicting_network_address")
         or (mode == "endpoint_not_in_network_map" and service == "postgres")
         else ""
     )
     network_id = "" if mode == "missing_container_network_id" and service == "postgres" else NETWORK_IDS[
         "eventsales-d0-proof_eventsales_data"
     ]
-    return {
+    attachment = {
         "NetworkID": network_id,
         "EndpointID": endpoint_id,
         "Gateway": "",
@@ -129,6 +131,29 @@ def network_attachment(service, mode):
         "Aliases": ["eventsales-d0-proof-" + service + "-1"],
         "DriverOpts": None,
     }
+    if mode in (
+        "cross_checked_membership",
+        "missing_container_network_addresses",
+        "conflicting_network_address",
+    ):
+        attachment.update({
+            "IPAddress": (
+                "172.18.0.99"
+                if mode == "conflicting_network_address" and service == "postgres"
+                else "172.18.0." + str(index)
+            ),
+            "GlobalIPv6Address": "2001:db8::" + str(index),
+            "MacAddress": "02:42:ac:12:00:" + format(index, "02x"),
+        })
+        if mode == "missing_container_network_addresses":
+            attachment.update({"IPAddress": "", "GlobalIPv6Address": "", "MacAddress": ""})
+    if mode == "null_network_aliases" and service == "postgres":
+        attachment["Aliases"] = None
+    elif mode == "missing_network_aliases" and service == "postgres":
+        del attachment["Aliases"]
+    elif mode == "malformed_network_aliases" and service == "postgres":
+        attachment["Aliases"] = "eventsales-d0-proof-postgres-1"
+    return attachment
 
 
 def container_inspect(service, second_read, mode):
@@ -184,7 +209,12 @@ def container_inspect(service, second_read, mode):
         del state["ExitCode"]
     if mode == "missing_oom" and service == "postgres":
         del state["OOMKilled"]
-    if mode in ("cross_checked_membership", "wrong_network_endpoint"):
+    if mode in (
+        "cross_checked_membership",
+        "wrong_network_endpoint",
+        "missing_container_network_addresses",
+        "conflicting_network_address",
+    ):
         state.update({"Status": "running", "Running": True, "FinishedAt": ""})
 
     networks = {
@@ -333,16 +363,25 @@ if MODULE is not None:
             members = {}
             if name == "eventsales-d0-proof_eventsales_data" and (
                 mode == "cross_checked_membership"
+                or mode in ("missing_container_network_addresses", "conflicting_network_address")
                 or (mode == "changed_network_membership" and second_read)
             ):
-                services = ("postgres", "pgbouncer", "redis") if mode == "cross_checked_membership" else ("postgres",)
+                services = (
+                    ("postgres", "pgbouncer", "redis")
+                    if mode in (
+                        "cross_checked_membership",
+                        "missing_container_network_addresses",
+                        "conflicting_network_address",
+                    )
+                    else ("postgres",)
+                )
                 for index, service in enumerate(services, start=2):
                     members[IDS[service]] = {
                         "Name": "eventsales-d0-proof-" + service + "-1",
                         "EndpointID": ENDPOINT_IDS[service],
                         "MacAddress": "02:42:ac:12:00:" + format(index, "02x"),
                         "IPv4Address": "172.18.0." + str(index) + "/16",
-                        "IPv6Address": "",
+                        "IPv6Address": "2001:db8::" + str(index),
                     }
             if mode == "unknown_network_member" and name == "eventsales-d0-proof_eventsales_data":
                 members["9" * 64] = {
@@ -624,6 +663,51 @@ class CollectorTests(unittest.TestCase):
         for member in data_network["members"]:
             self.assertEqual(member["cross_check"]["network_id"], "MATCH")
             self.assertEqual(member["cross_check"]["endpoint_id"], "MATCH")
+            self.assertEqual(member["cross_check"]["mac_address"], "MATCH")
+            self.assertEqual(member["cross_check"]["ipv4_address"], "MATCH")
+            self.assertEqual(member["cross_check"]["ipv6_address"], "MATCH")
+
+    @unittest.skipUnless(COLLECTOR_EXISTS, "collector has not been implemented")
+    def test_accepts_null_or_missing_aliases_as_unavailable(self):
+        for mode in ("null_network_aliases", "missing_network_aliases"):
+            with self.subTest(mode=mode):
+                self.server.mode = mode
+                code, output = self.collect()
+                self.assertEqual(code, 0, f"optional aliases should not reject the inspection: {output!r}")
+                report = json.loads(output)
+                postgres = next(row for row in report["objects"]["containers"]
+                                if row["service"] == "postgres")
+                aliases = postgres["configured_networks"]["eventsales-d0-proof_eventsales_data"]
+                self.assertIsNone(aliases["aliases"])
+                self.assertEqual(aliases["aliases_status"], "UNAVAILABLE")
+
+    @unittest.skipUnless(COLLECTOR_EXISTS, "collector has not been implemented")
+    def test_rejects_malformed_aliases(self):
+        self.server.mode = "malformed_network_aliases"
+        code, output = self.collect()
+        self.assertNotEqual(code, 0)
+        self.assertEqual(output, b"D0_INSPECTION=INCOMPLETE STOP=CONTAINER_NETWORKS\n")
+
+    @unittest.skipUnless(COLLECTOR_EXISTS, "collector has not been implemented")
+    def test_marks_missing_network_addresses_unavailable_and_partial(self):
+        self.server.mode = "missing_container_network_addresses"
+        code, output = self.collect()
+        self.assertNotEqual(code, 0, "running containers must not match the stopped-state profile")
+        report = json.loads(output)
+        data_network = next(row for row in report["objects"]["networks"]
+                            if row["name"] == "eventsales-d0-proof_eventsales_data")
+        self.assertEqual(data_network["membership_status"], "OBSERVED_WITH_PARTIAL_CONTAINER_CROSS_CHECK")
+        for member in data_network["members"]:
+            self.assertEqual(member["cross_check"]["mac_address"], "UNAVAILABLE")
+            self.assertEqual(member["cross_check"]["ipv4_address"], "UNAVAILABLE")
+            self.assertEqual(member["cross_check"]["ipv6_address"], "UNAVAILABLE")
+
+    @unittest.skipUnless(COLLECTOR_EXISTS, "collector has not been implemented")
+    def test_rejects_conflicting_network_addresses(self):
+        self.server.mode = "conflicting_network_address"
+        code, output = self.collect()
+        self.assertNotEqual(code, 0)
+        self.assertEqual(output, b"D0_INSPECTION=INCOMPLETE STOP=NETWORK_ADDRESS_MISMATCH\n")
 
     @unittest.skipUnless(COLLECTOR_EXISTS, "collector has not been implemented")
     def test_accepts_docker_shaped_bind_and_tmpfs_mounts(self):
