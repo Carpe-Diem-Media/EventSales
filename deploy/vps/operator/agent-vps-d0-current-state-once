@@ -1,0 +1,463 @@
+#!/bin/bash -p
+set -euo pipefail
+set +x
+umask 077
+
+if (($# != 0)); then
+  printf '%s\n' 'D0_CAPTURE=INCOMPLETE STOP=ARGUMENTS'
+  exit 64
+fi
+REQUIRED_EUID=0
+if ((EUID != REQUIRED_EUID)); then
+  printf '%s\n' 'D0_CAPTURE=INCOMPLETE STOP=PRIVILEGE'
+  exit 77
+fi
+cd / 2>/dev/null || {
+  printf '%s\n' 'D0_CAPTURE=INCOMPLETE STOP=WORKING_DIRECTORY'
+  exit 78
+}
+
+exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/nonexistent /usr/bin/python3 -I -S -B - <<'PY'
+import datetime
+import hashlib
+import json
+import os
+import resource
+import signal
+import stat
+import subprocess
+import sys
+
+REQUIRED_UID = 0
+REQUIRED_GID = 0
+EVIDENCE_PARENT = "/root"
+EVIDENCE_NAME = "eventsales-d0-current-state-once"
+COLLECTOR_PATH = "/usr/local/sbin/agent-vps-d0-current-state-inspect"
+COLLECTOR_SHA256 = "91e7f6adce032f514eeff512998952b623b20232e95d71b3cf00e4fc4c15a124"
+MAX_COLLECTOR_BYTES = 262144
+MAX_RUNTIME_SECONDS = 55.0
+MAX_OUTPUT_BYTES = 65536
+MAX_METADATA_BYTES = 16384
+POST_KILL_WAIT_SECONDS = 2.0
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+CHILD_ENV = {
+    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+    "LC_ALL": "C",
+    "HOME": "/nonexistent",
+    "DOCKER_CONFIG": "/nonexistent/eventsales-d0-inspect-config",
+    "DOCKER_HOST": "unix:///run/docker.sock",
+}
+
+
+class CaptureError(Exception):
+    def __init__(self, code):
+        self.code = code
+
+
+def fail(code):
+    raise CaptureError(code)
+
+
+def emit(code, status=None):
+    if code == "COMPLETE":
+        line, default_status = "D0_CAPTURE=COMPLETE", 0
+    else:
+        line, default_status = "D0_CAPTURE=INCOMPLETE STOP=" + code, 1
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+    return default_status if status is None else status
+
+
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def open_evidence_parent():
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        descriptor = os.open(EVIDENCE_PARENT, flags)
+        info = os.fstat(descriptor)
+    except OSError:
+        fail("EVIDENCE_PARENT")
+    if (
+        not os.path.isabs(EVIDENCE_PARENT)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != REQUIRED_UID
+        or info.st_gid != REQUIRED_GID
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        os.close(descriptor)
+        fail("EVIDENCE_PARENT")
+    return descriptor
+
+
+def create_evidence(parent_fd):
+    if not EVIDENCE_NAME or os.path.basename(EVIDENCE_NAME) != EVIDENCE_NAME:
+        fail("EVIDENCE_CREATE")
+    try:
+        os.mkdir(EVIDENCE_NAME, 0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        fail("ALREADY_USED")
+    except OSError:
+        fail("EVIDENCE_CREATE")
+    try:
+        os.fsync(parent_fd)
+        descriptor = os.open(
+            EVIDENCE_NAME,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+    except OSError:
+        fail("EVIDENCE_DIRECTORY")
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != REQUIRED_UID
+        or info.st_gid != REQUIRED_GID
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        os.close(descriptor)
+        fail("EVIDENCE_DIRECTORY")
+    return descriptor
+
+
+def create_private_file(directory_fd, name):
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    except OSError:
+        fail("EVIDENCE_FILES")
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != REQUIRED_UID
+        or info.st_gid != REQUIRED_GID
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        os.close(descriptor)
+        fail("EVIDENCE_FILES")
+    return descriptor
+
+
+def write_all(descriptor, payload):
+    view = memoryview(payload)
+    while view:
+        try:
+            written = os.write(descriptor, view)
+        except OSError:
+            fail("EVIDENCE_WRITE")
+        if written <= 0:
+            fail("EVIDENCE_WRITE")
+        view = view[written:]
+
+
+def write_metadata(descriptor, metadata):
+    payload = (json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+    if len(payload) > MAX_METADATA_BYTES:
+        fail("METADATA_LIMIT")
+    try:
+        os.ftruncate(descriptor, 0)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        write_all(descriptor, payload)
+        os.fsync(descriptor)
+    except OSError:
+        fail("METADATA_WRITE")
+
+
+def open_and_verify_collector(metadata):
+    try:
+        descriptor = os.open(COLLECTOR_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        before = os.fstat(descriptor)
+    except OSError:
+        fail("COLLECTOR_IDENTITY")
+    if (
+        not os.path.isabs(COLLECTOR_PATH)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != REQUIRED_UID
+        or before.st_gid != REQUIRED_GID
+        or before.st_mode & 0o022
+        or before.st_mode & 0o6000
+        or before.st_mode & 0o500 != 0o500
+        or before.st_size > MAX_COLLECTOR_BYTES
+    ):
+        os.close(descriptor)
+        fail("COLLECTOR_IDENTITY")
+    digest = hashlib.sha256()
+    total = 0
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        piece = os.read(descriptor, 16384)
+        if not piece:
+            break
+        total += len(piece)
+        if total > MAX_COLLECTOR_BYTES:
+            os.close(descriptor)
+            fail("COLLECTOR_IDENTITY")
+        digest.update(piece)
+    after = os.fstat(descriptor)
+    identity_before = (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_gid, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_gid, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+    observed = digest.hexdigest()
+    metadata["collector_observed_sha256"] = observed
+    if identity_before != identity_after or observed != COLLECTOR_SHA256:
+        os.close(descriptor)
+        fail("COLLECTOR_IDENTITY")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return descriptor
+
+
+def set_child_file_limit():
+    limit = MAX_OUTPUT_BYTES + 1
+    resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+
+
+def kill_process_group(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def capture_summary(descriptor, name, metadata):
+    sync_failed = False
+    try:
+        os.fsync(descriptor)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != REQUIRED_UID
+            or info.st_gid != REQUIRED_GID
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            fail("EVIDENCE_FILES")
+        observed = info.st_size
+        overflow = observed > MAX_OUTPUT_BYTES
+        stored = min(observed, MAX_OUTPUT_BYTES)
+        if overflow:
+            os.ftruncate(descriptor, MAX_OUTPUT_BYTES)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        read_count = 0
+        while read_count < stored:
+            chunk = os.read(descriptor, min(16384, stored - read_count))
+            if not chunk:
+                fail("EVIDENCE_READ")
+            digest.update(chunk)
+            read_count += len(chunk)
+        os.fsync(descriptor)
+    except CaptureError:
+        raise
+    except OSError:
+        sync_failed = True
+        try:
+            info = os.fstat(descriptor)
+            observed = info.st_size
+            overflow = observed > MAX_OUTPUT_BYTES
+            stored = min(observed, MAX_OUTPUT_BYTES)
+            if overflow:
+                os.ftruncate(descriptor, MAX_OUTPUT_BYTES)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            digest = hashlib.sha256()
+            read_count = 0
+            while read_count < stored:
+                chunk = os.read(descriptor, min(16384, stored - read_count))
+                if not chunk:
+                    fail("EVIDENCE_READ")
+                digest.update(chunk)
+                read_count += len(chunk)
+        except CaptureError:
+            raise
+        except OSError:
+            fail("EVIDENCE_READ")
+    metadata[name + "_size_bytes"] = stored
+    metadata[name + "_observed_bytes"] = observed
+    metadata[name + "_sha256"] = digest.hexdigest()
+    metadata[name + "_truncated"] = overflow
+    if sync_failed:
+        fail("EVIDENCE_WRITE")
+    return overflow
+
+
+def initial_metadata(started_at):
+    return {
+        "schema": "eventsales.g47.one-shot-capture.v1",
+        "mechanism": "G47_ONE_SHOT",
+        "result": "INCOMPLETE",
+        "failure_code": "IN_PROGRESS",
+        "collector_path": COLLECTOR_PATH,
+        "collector_expected_sha256": COLLECTOR_SHA256,
+        "collector_observed_sha256": None,
+        "wrapper_started_at_utc": started_at,
+        "collector_started_at_utc": None,
+        "collector_finished_at_utc": None,
+        "wrapper_finished_at_utc": None,
+        "collector_invocation_count": 0,
+        "collector_exit_code": None,
+        "collector_timed_out": False,
+        "stdout_size_bytes": 0,
+        "stdout_observed_bytes": 0,
+        "stdout_sha256": EMPTY_SHA256,
+        "stdout_truncated": False,
+        "stderr_size_bytes": 0,
+        "stderr_observed_bytes": 0,
+        "stderr_sha256": EMPTY_SHA256,
+        "stderr_truncated": False,
+    }
+
+
+def main():
+    if os.geteuid() != REQUIRED_UID or os.getegid() != REQUIRED_GID:
+        return emit("PRIVILEGE", 77)
+    started_at = utc_now()
+    try:
+        parent_fd = open_evidence_parent()
+    except CaptureError as error:
+        return emit(error.code)
+    try:
+        evidence_fd = create_evidence(parent_fd)
+    except CaptureError as error:
+        os.close(parent_fd)
+        return emit(error.code)
+    os.close(parent_fd)
+
+    metadata = initial_metadata(started_at)
+    metadata_fd = None
+    stdout_fd = None
+    stderr_fd = None
+    collector_fd = None
+    process = None
+    signal_state = [None]
+    previous_handlers = {}
+    failure_code = "INTERNAL"
+
+    def handle_signal(number, _frame):
+        signal_state[0] = number
+        if process is not None:
+            kill_process_group(process)
+
+    try:
+        metadata_fd = create_private_file(evidence_fd, "metadata.json")
+        stdout_fd = create_private_file(evidence_fd, "collector.stdout")
+        stderr_fd = create_private_file(evidence_fd, "collector.stderr")
+        os.fsync(evidence_fd)
+        write_metadata(metadata_fd, metadata)
+        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            previous_handlers[number] = signal.signal(number, handle_signal)
+
+        collector_fd = open_and_verify_collector(metadata)
+        if signal_state[0] is not None:
+            fail("INTERRUPTED")
+        proc_path = "/proc/self/fd/" + str(collector_fd)
+        try:
+            process = subprocess.Popen(
+                [proc_path],
+                executable=proc_path,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_fd,
+                stderr=stderr_fd,
+                cwd="/",
+                env=CHILD_ENV,
+                close_fds=True,
+                pass_fds=(collector_fd,),
+                start_new_session=True,
+                preexec_fn=set_child_file_limit,
+            )
+        except (OSError, subprocess.SubprocessError):
+            failure_code = "COLLECTOR_START"
+            raise CaptureError(failure_code)
+        metadata["collector_invocation_count"] = 1
+        metadata["collector_started_at_utc"] = utc_now()
+        try:
+            process.wait(timeout=MAX_RUNTIME_SECONDS)
+        except subprocess.TimeoutExpired:
+            metadata["collector_timed_out"] = True
+            failure_code = "TIMEOUT"
+            kill_process_group(process)
+            try:
+                process.wait(timeout=POST_KILL_WAIT_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+        if signal_state[0] is not None and failure_code == "INTERNAL":
+            failure_code = "INTERRUPTED"
+        metadata["collector_exit_code"] = process.returncode
+        metadata["collector_finished_at_utc"] = utc_now()
+        if failure_code == "INTERNAL" and process.returncode != 0:
+            failure_code = "COLLECTOR_EXIT"
+        failure_code = "COMPLETE" if failure_code == "INTERNAL" else failure_code
+    except CaptureError as error:
+        failure_code = error.code
+    except BaseException:
+        failure_code = "INTERNAL"
+    finally:
+        if process is not None and process.poll() is None:
+            kill_process_group(process)
+            try:
+                process.wait(timeout=POST_KILL_WAIT_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+        metadata["collector_exit_code"] = None if process is None else process.returncode
+        if metadata["collector_invocation_count"] == 1 and metadata["collector_finished_at_utc"] is None:
+            metadata["collector_finished_at_utc"] = utc_now()
+        for number, handler in previous_handlers.items():
+            signal.signal(number, handler)
+        overflow = False
+        for name, descriptor in (("stdout", stdout_fd), ("stderr", stderr_fd)):
+            if descriptor is not None:
+                try:
+                    overflow = capture_summary(descriptor, name, metadata) or overflow
+                except CaptureError as error:
+                    failure_code = error.code
+        if process is not None and process.returncode == -signal.SIGXFSZ:
+            overflow = True
+        if overflow:
+            failure_code = "OUTPUT_LIMIT"
+        metadata["wrapper_finished_at_utc"] = utc_now()
+        if collector_fd is not None:
+            try:
+                os.close(collector_fd)
+            except OSError:
+                failure_code = "COLLECTOR_IDENTITY"
+        try:
+            os.fsync(evidence_fd)
+        except OSError:
+            failure_code = "EVIDENCE_WRITE"
+        metadata["result"] = "COMPLETE" if failure_code == "COMPLETE" else "INCOMPLETE"
+        metadata["failure_code"] = None if failure_code == "COMPLETE" else failure_code
+        if metadata_fd is not None:
+            try:
+                write_metadata(metadata_fd, metadata)
+            except CaptureError:
+                failure_code = "METADATA_WRITE"
+            try:
+                os.close(metadata_fd)
+            except OSError:
+                failure_code = "METADATA_WRITE"
+        for descriptor in (stdout_fd, stderr_fd):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    failure_code = "EVIDENCE_WRITE"
+        try:
+            os.close(evidence_fd)
+        except OSError:
+            failure_code = "EVIDENCE_WRITE"
+
+    if failure_code == "COMPLETE":
+        return emit("COMPLETE")
+    return emit(failure_code)
+
+
+try:
+    exit_status = main()
+except Exception:
+    sys.stdout.write("D0_CAPTURE=INCOMPLETE STOP=INTERNAL\n")
+    sys.stdout.flush()
+    sys.exit(1)
+sys.exit(exit_status)
+PY
