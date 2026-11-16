@@ -33,6 +33,11 @@ NETWORK_IDS = {
     "eventsales-d0-proof_eventsales_data": "a" * 64,
     "eventsales-d0-proof_eventsales_edge": "b" * 64,
 }
+ENDPOINT_IDS = {
+    "postgres": "c" * 64,
+    "pgbouncer": "d" * 64,
+    "redis": "e" * 64,
+}
 IMAGE_IDS = {
     "postgres": "sha256:" + "4" * 64,
     "pgbouncer": "sha256:" + "5" * 64,
@@ -71,7 +76,6 @@ def network_row(name, internal):
         "ConfigFrom": {"Network": ""},
         "ConfigOnly": False,
         "IPAM": {"Driver": "default", "Options": None, "Config": []},
-        "Containers": {},
         "Options": None,
         "Labels": {
             "com.docker.compose.project": "eventsales-d0-proof",
@@ -102,10 +106,19 @@ def volume_inspect():
     }
 
 
-def network_attachment(service):
+def network_attachment(service, mode):
+    endpoint_id = (
+        ENDPOINT_IDS[service]
+        if mode in ("cross_checked_membership", "wrong_network_endpoint")
+        or (mode == "endpoint_not_in_network_map" and service == "postgres")
+        else ""
+    )
+    network_id = "" if mode == "missing_container_network_id" and service == "postgres" else NETWORK_IDS[
+        "eventsales-d0-proof_eventsales_data"
+    ]
     return {
-        "NetworkID": NETWORK_IDS["eventsales-d0-proof_eventsales_data"],
-        "EndpointID": "",
+        "NetworkID": network_id,
+        "EndpointID": endpoint_id,
         "Gateway": "",
         "IPAddress": "",
         "IPPrefixLen": 0,
@@ -135,25 +148,25 @@ def container_inspect(service, second_read, mode):
     elif service == "pgbouncer":
         mounts.append({
             "Type": "tmpfs",
-            "Name": "",
             "Source": "",
             "Destination": "/tmp",
-            "Driver": "",
-            "Mode": "rw,noexec,nosuid,nodev,size=64m,mode=1777",
+            "Mode": "",
             "RW": True,
             "Propagation": "",
         })
-        if mode == "changed_mounts" and second_read:
+        if mode == "valid_bind_mount" or (mode == "changed_mounts" and second_read):
             mounts.append({
                 "Type": "bind",
-                "Name": "",
-                "Source": "/srv/" + SENTINEL,
-                "Destination": "/unexpected",
-                "Driver": "",
+                "Source": "/srv/config" if mode == "valid_bind_mount" else "/srv/" + SENTINEL,
+                "Destination": "/etc/service" if mode == "valid_bind_mount" else "/unexpected",
                 "Mode": "ro",
                 "RW": False,
                 "Propagation": "rprivate",
             })
+    if service == "postgres" and mode == "missing_volume_mount_name":
+        del mounts[0]["Name"]
+    if service == "postgres" and mode == "missing_volume_mount_driver":
+        del mounts[0]["Driver"]
 
     state = {
         "Status": "exited",
@@ -171,13 +184,15 @@ def container_inspect(service, second_read, mode):
         del state["ExitCode"]
     if mode == "missing_oom" and service == "postgres":
         del state["OOMKilled"]
+    if mode in ("cross_checked_membership", "wrong_network_endpoint"):
+        state.update({"Status": "running", "Running": True, "FinishedAt": ""})
 
     networks = {
-        "eventsales-d0-proof_eventsales_data": network_attachment(service),
+        "eventsales-d0-proof_eventsales_data": network_attachment(service, mode),
     }
     if mode == "extra_configured_network" and service == "redis":
         networks["eventsales-d0-proof_eventsales_edge"] = {
-            **network_attachment(service),
+            **network_attachment(service, mode),
             "NetworkID": NETWORK_IDS["eventsales-d0-proof_eventsales_edge"],
         }
 
@@ -240,6 +255,15 @@ if MODULE is not None:
                 body = self.container_list(mode)
             elif path == MODULE.NETWORKS_PATH:
                 body = self.network_list(mode)
+            elif path.startswith(MODULE.API + "/networks/"):
+                ident = path.rsplit("/", 1)[-1]
+                name = next((key for key, value in NETWORK_IDS.items() if value == ident), None)
+                if name is None:
+                    self.send(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                    return
+                second_read = sum(1 for method, seen in self.server.requests
+                                  if method == "GET" and seen == path) > 1
+                body = self.network_inspect(name, mode, second_read)
             elif path == MODULE.VOLUMES_PATH:
                 body = self.volume_list(mode)
             elif path == MODULE.VOLUME_INSPECT_PATH:
@@ -300,19 +324,50 @@ if MODULE is not None:
             ]
             if mode == "extra_network":
                 rows.append(network_row("eventsales-d0-proof_unexpected", False))
-            if mode == "missing_network_members":
-                del rows[0]["Containers"]
-            if mode == "unknown_network_member":
-                rows[0]["Containers"]["9" * 64] = {
+            if mode == "wrong_network_id":
+                rows[0]["Id"] = "bad"
+            return json.dumps(rows).encode()
+
+        def network_inspect(self, name, mode, second_read):
+            result = network_row(name, name == "eventsales-d0-proof_eventsales_data")
+            members = {}
+            if name == "eventsales-d0-proof_eventsales_data" and (
+                mode == "cross_checked_membership"
+                or (mode == "changed_network_membership" and second_read)
+            ):
+                services = ("postgres", "pgbouncer", "redis") if mode == "cross_checked_membership" else ("postgres",)
+                for index, service in enumerate(services, start=2):
+                    members[IDS[service]] = {
+                        "Name": "eventsales-d0-proof-" + service + "-1",
+                        "EndpointID": ENDPOINT_IDS[service],
+                        "MacAddress": "02:42:ac:12:00:" + format(index, "02x"),
+                        "IPv4Address": "172.18.0." + str(index) + "/16",
+                        "IPv6Address": "",
+                    }
+            if mode == "unknown_network_member" and name == "eventsales-d0-proof_eventsales_data":
+                members["9" * 64] = {
                     "Name": "unexpected",
-                    "EndpointID": "endpoint",
+                    "EndpointID": "f" * 64,
                     "MacAddress": "",
                     "IPv4Address": "",
                     "IPv6Address": "",
                 }
-            if mode == "wrong_network_id":
-                rows[0]["Id"] = "bad"
-            return json.dumps(rows).encode()
+            if mode == "wrong_network_endpoint" and name == "eventsales-d0-proof_eventsales_data":
+                members[IDS["postgres"]] = {
+                    "Name": "eventsales-d0-proof-postgres-1",
+                    "EndpointID": "f" * 64,
+                    "MacAddress": "",
+                    "IPv4Address": "",
+                    "IPv6Address": "",
+                }
+            result["Containers"] = members
+            if mode == "wrong_network_inspect_id" and name == "eventsales-d0-proof_eventsales_data":
+                result["Id"] = "9" * 64
+            if mode == "missing_network_inspect_members" and name == "eventsales-d0-proof_eventsales_data":
+                del result["Containers"]
+            if mode == "null_network_inspect_members":
+                result["Containers"] = None
+            return json.dumps(result).encode()
 
         def volume_list(self, mode):
             rows = [volume_row()]
@@ -396,8 +451,17 @@ class CollectorTests(unittest.TestCase):
             {name: row["id"] for name, row in networks.items()},
             NETWORK_IDS,
         )
-        self.assertEqual(networks["eventsales-d0-proof_eventsales_data"]["members"], [])
-        self.assertEqual(networks["eventsales-d0-proof_eventsales_edge"]["members"], [])
+        self.assertNotIn("Containers", network_row("eventsales-d0-proof_eventsales_data", True))
+        data_network = networks["eventsales-d0-proof_eventsales_data"]
+        edge_network = networks["eventsales-d0-proof_eventsales_edge"]
+        self.assertEqual(data_network["members"], [])
+        self.assertEqual(data_network["membership_status"], "STOPPED_ENDPOINTS_UNAVAILABLE")
+        self.assertEqual(
+            {row["id"] for row in data_network["unavailable_stopped_members"]},
+            set(IDS.values()),
+        )
+        self.assertEqual(edge_network["members"], [])
+        self.assertEqual(edge_network["membership_status"], "OBSERVED_EMPTY")
         volume = report["objects"]["volumes"][0]
         self.assertEqual(volume["name"], "eventsales-d0-proof_postgres_data")
         self.assertEqual(volume["created_at"], "2026-11-01T00:00:00Z")
@@ -408,6 +472,10 @@ class CollectorTests(unittest.TestCase):
         postgres = containers["postgres"]
         self.assertEqual(postgres["state"]["exit_code"], 0)
         self.assertFalse(postgres["state"]["oom_killed"])
+        self.assertEqual(postgres["network_configuration_status"], "PARTIALLY_AVAILABLE")
+        postgres_network = postgres["configured_networks"]["eventsales-d0-proof_eventsales_data"]
+        self.assertEqual(postgres_network["network_id_status"], "VERIFIED")
+        self.assertEqual(postgres_network["endpoint_id_status"], "UNAVAILABLE")
         self.assertEqual(postgres["image_id"], IMAGE_IDS["postgres"])
         self.assertTrue(postgres["mounts"])
         attachment = postgres["postgres_volume_attachment"]
@@ -428,8 +496,12 @@ class CollectorTests(unittest.TestCase):
             MODULE.VOLUMES_PATH,
             MODULE.VOLUME_INSPECT_PATH,
         }
+        network_inspect_paths = {
+            MODULE.API + "/networks/" + ident for ident in NETWORK_IDS.values()
+        }
         self.assertTrue(all(
             path in allowed
+            or path in network_inspect_paths
             or (
                 path.startswith(MODULE.API + "/containers/")
                 and path.endswith("/json")
@@ -487,14 +559,88 @@ class CollectorTests(unittest.TestCase):
                 self.assertIn(b"STOP=", output)
 
     @unittest.skipUnless(COLLECTOR_EXISTS, "collector has not been implemented")
-    def test_rejects_incomplete_or_unexpected_network_membership(self):
-        for mode in ("missing_network_members", "unknown_network_member"):
+    def test_rejects_invalid_network_inspection_membership(self):
+        for mode in (
+            "unknown_network_member",
+            "wrong_network_inspect_id",
+            "wrong_network_endpoint",
+            "changed_network_membership",
+            "endpoint_not_in_network_map",
+        ):
             with self.subTest(mode=mode):
                 self.server.mode = mode
                 self.server.requests = []
                 code, output = self.collect()
                 self.assertNotEqual(code, 0)
                 self.assertIn(b"STOP=", output)
+
+    @unittest.skipUnless(COLLECTOR_EXISTS, "collector has not been implemented")
+    def test_marks_unavailable_network_inspection_membership_without_claiming_empty(self):
+        for mode in ("missing_network_inspect_members", "null_network_inspect_members"):
+            with self.subTest(mode=mode):
+                self.server.mode = mode
+                self.server.requests = []
+                code, output = self.collect()
+                self.assertEqual(code, 0, f"stopped endpoint absence is reported as unavailable: {output!r}")
+                report = json.loads(output)
+                networks = {row["name"]: row for row in report["objects"]["networks"]}
+                data_network = networks["eventsales-d0-proof_eventsales_data"]
+                edge_network = networks["eventsales-d0-proof_eventsales_edge"]
+                self.assertEqual(data_network["membership_status"], "STOPPED_ENDPOINTS_UNAVAILABLE")
+                self.assertEqual({row["id"] for row in data_network["unavailable_stopped_members"]}, set(IDS.values()))
+                self.assertFalse(data_network["membership_data_available"])
+                expected_edge_status = "OBSERVED_EMPTY" if mode == "missing_network_inspect_members" else "MEMBERSHIP_UNAVAILABLE"
+                self.assertEqual(edge_network["membership_status"], expected_edge_status)
+                self.assertEqual(edge_network["members"], [])
+
+    @unittest.skipUnless(COLLECTOR_EXISTS, "collector has not been implemented")
+    def test_does_not_treat_blank_container_network_id_as_verified(self):
+        self.server.mode = "missing_container_network_id"
+        code, output = self.collect()
+        self.assertEqual(code, 0, f"stopped container network identity is recorded as unavailable: {output!r}")
+        report = json.loads(output)
+        postgres = next(row for row in report["objects"]["containers"]
+                        if row["service"] == "postgres")
+        data_network = next(row for row in report["objects"]["networks"]
+                            if row["name"] == "eventsales-d0-proof_eventsales_data")
+        configured = postgres["configured_networks"]["eventsales-d0-proof_eventsales_data"]
+        self.assertEqual(configured["network_id"], "")
+        self.assertEqual(configured["network_id_status"], "UNAVAILABLE")
+        self.assertEqual(postgres["network_configuration_status"], "PARTIALLY_AVAILABLE")
+        self.assertIn(IDS["postgres"], {
+            row["id"] for row in data_network["unavailable_stopped_members"]
+        })
+
+    @unittest.skipUnless(COLLECTOR_EXISTS, "collector has not been implemented")
+    def test_cross_checks_network_inspection_membership_with_container_settings(self):
+        self.server.mode = "cross_checked_membership"
+        code, output = self.collect()
+        self.assertNotEqual(code, 0, "running containers must not match the stopped-state profile")
+        report = json.loads(output)
+        networks = {row["name"]: row for row in report["objects"]["networks"]}
+        data_network = networks["eventsales-d0-proof_eventsales_data"]
+        self.assertEqual(data_network["membership_status"], "OBSERVED")
+        self.assertEqual({row["id"] for row in data_network["members"]}, set(IDS.values()))
+        for member in data_network["members"]:
+            self.assertEqual(member["cross_check"]["network_id"], "MATCH")
+            self.assertEqual(member["cross_check"]["endpoint_id"], "MATCH")
+
+    @unittest.skipUnless(COLLECTOR_EXISTS, "collector has not been implemented")
+    def test_accepts_docker_shaped_bind_and_tmpfs_mounts(self):
+        self.server.mode = "valid_bind_mount"
+        code, output = self.collect()
+        self.assertEqual(code, 0, f"Docker-shaped bind/tmpfs mounts should be accepted: {output!r}")
+        report = json.loads(output)
+        pgbouncer = next(row for row in report["objects"]["containers"]
+                         if row["service"] == "pgbouncer")
+        mounts = {mount["type"]: mount for mount in pgbouncer["mounts"]}
+        self.assertEqual(mounts["tmpfs"]["source"], "")
+        self.assertNotIn("name", mounts["tmpfs"])
+        self.assertNotIn("driver", mounts["tmpfs"])
+        self.assertEqual(mounts["bind"]["source"], "/srv/config")
+        self.assertEqual(mounts["bind"]["destination"], "/etc/service")
+        self.assertNotIn("name", mounts["bind"])
+        self.assertNotIn("driver", mounts["bind"])
 
     @unittest.skipUnless(COLLECTOR_EXISTS, "collector has not been implemented")
     def test_rejects_changed_mounts_during_collection(self):
@@ -523,6 +669,8 @@ class CollectorTests(unittest.TestCase):
             "missing_oom",
             "missing_mounts",
             "missing_volume_mountpoint",
+            "missing_volume_mount_name",
+            "missing_volume_mount_driver",
         ):
             with self.subTest(mode=mode):
                 self.server.mode = mode

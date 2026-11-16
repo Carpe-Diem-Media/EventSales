@@ -47,13 +47,15 @@ IMAGE_REFERENCES = {
 PROJECT_FILTER = "%7B%22label%22%3A%5B%22com.docker.compose.project%3Deventsales-d0-proof%22%5D%7D"
 CONTAINERS_PATH = API + "/containers/json?all=1&filters=" + PROJECT_FILTER
 NETWORKS_PATH = API + "/networks?filters=" + PROJECT_FILTER
+NETWORK_INSPECT_PREFIX = API + "/networks/"
 VOLUMES_PATH = API + "/volumes?filters=" + PROJECT_FILTER
 VOLUME_INSPECT_PATH = API + "/volumes/" + VOLUME
-MAX_REQUESTS = 15
+MAX_REQUESTS = 19
 deadline = 0.0
 request_count = 0
 total_response_bytes = 0
 verified_ids = set()
+verified_network_ids = set()
 version_accepted = False
 
 
@@ -80,6 +82,9 @@ def allowed(path):
         return False
     if path in (CONTAINERS_PATH, NETWORKS_PATH, VOLUMES_PATH, VOLUME_INSPECT_PATH):
         return True
+    for ident in verified_network_ids:
+        if path == NETWORK_INSPECT_PREFIX + ident:
+            return True
     for ident in verified_ids:
         if path == API + "/containers/" + ident + "/json":
             return True
@@ -375,7 +380,7 @@ def normalized_labels(labels, required, code):
     return result
 
 
-def network_inventory(value, container_ids):
+def network_inventory(value):
     rows = require_list(value, "NETWORK_INVENTORY")
     if len(rows) != 2:
         fail("NETWORK_COUNT")
@@ -413,45 +418,6 @@ def network_inventory(value, container_ids):
         require_string(obj.get("Created"), "NETWORK_CREATED")
         options = optional_dict(obj.get("Options"), "NETWORK_OPTIONS")
         ipam = require_dict(obj.get("IPAM"), "NETWORK_IPAM")
-        member_map = require_dict(obj.get("Containers"), "NETWORK_MEMBERSHIP")
-        members = []
-        for member_id, member_value in member_map.items():
-            ident_member = docker_id(member_id, "NETWORK_MEMBER")
-            if ident_member not in container_ids.values():
-                fail("NETWORK_MEMBER")
-            member = require_dict(member_value, "NETWORK_MEMBER")
-            name_value = require_string(member.get("Name"), "NETWORK_MEMBER")
-            endpoint_id = require_string(
-                member.get("EndpointID"),
-                "NETWORK_MEMBER",
-                allow_empty=True,
-            )
-            mac = require_string(
-                member.get("MacAddress"),
-                "NETWORK_MEMBER",
-                allow_empty=True,
-            )
-            ipv4 = require_string(
-                member.get("IPv4Address"),
-                "NETWORK_MEMBER",
-                allow_empty=True,
-            )
-            ipv6 = require_string(
-                member.get("IPv6Address"),
-                "NETWORK_MEMBER",
-                allow_empty=True,
-            )
-            service = next(key for key, value in container_ids.items() if value == ident_member)
-            if name_value != PROJECT + "-" + service + "-1":
-                fail("NETWORK_MEMBER")
-            members.append({
-                "id": ident_member,
-                "name": name_value,
-                "endpoint_id": endpoint_id,
-                "mac_address": mac,
-                "ipv4_address": ipv4,
-                "ipv6_address": ipv6,
-            })
         results[name] = {
             "id": ident,
             "name": name,
@@ -462,11 +428,176 @@ def network_inventory(value, container_ids):
             "labels": labels,
             "options": options,
             "ipam": ipam,
-            "members": sorted(members, key=lambda member: member["id"]),
         }
     if set(results) != set(expected):
         fail("NETWORK_IDENTITY")
     return {name: results[name] for name in (DATA, EDGE)}
+
+
+def network_inspection(value, listed, container_ids):
+    obj = require_dict(value, "NETWORK_INVALID")
+    ident = docker_id(obj.get("Id"), "NETWORK_ID")
+    name = require_string(obj.get("Name"), "NETWORK_INVALID")
+    if ident != listed["id"] or name != listed["name"]:
+        fail("NETWORK_IDENTITY_CHANGED")
+    labels = normalized_labels(
+        obj.get("Labels"),
+        ("com.docker.compose.project", "com.docker.compose.network"),
+        "NETWORK_LABELS",
+    )
+    options = optional_dict(obj.get("Options"), "NETWORK_OPTIONS")
+    ipam = require_dict(obj.get("IPAM"), "NETWORK_IPAM")
+    if (
+        require_string(obj.get("Created"), "NETWORK_CREATED") != listed["created"]
+        or obj.get("Scope") != listed["scope"]
+        or obj.get("Driver") != listed["driver"]
+        or require_bool(obj.get("Internal"), "NETWORK_INTERNAL") is not listed["internal"]
+        or labels != listed["labels"]
+        or options != listed["options"]
+        or ipam != listed["ipam"]
+    ):
+        fail("NETWORK_CHANGED_DURING_COLLECTION")
+
+    raw_member_map = obj.get("Containers")
+    if raw_member_map is None:
+        member_map = {}
+        membership_data_available = False
+    else:
+        member_map = require_dict(raw_member_map, "NETWORK_MEMBERSHIP")
+        membership_data_available = True
+    members = []
+    for member_id, member_value in member_map.items():
+        member_ident = docker_id(member_id, "NETWORK_MEMBER")
+        if member_ident not in container_ids.values():
+            fail("NETWORK_MEMBER")
+        member = require_dict(member_value, "NETWORK_MEMBER")
+        service = next(key for key, value in container_ids.items() if value == member_ident)
+        member_name = require_string(member.get("Name"), "NETWORK_MEMBER")
+        endpoint_id = require_string(
+            member.get("EndpointID"),
+            "NETWORK_MEMBER",
+            allow_empty=True,
+        )
+        if endpoint_id:
+            endpoint_id = docker_id(endpoint_id, "NETWORK_MEMBER")
+        if member_name != PROJECT + "-" + service + "-1":
+            fail("NETWORK_MEMBER")
+        members.append({
+            "id": member_ident,
+            "name": member_name,
+            "endpoint_id": endpoint_id,
+            "mac_address": require_string(
+                member.get("MacAddress"),
+                "NETWORK_MEMBER",
+                allow_empty=True,
+            ),
+            "ipv4_address": require_string(
+                member.get("IPv4Address"),
+                "NETWORK_MEMBER",
+                allow_empty=True,
+            ),
+            "ipv6_address": require_string(
+                member.get("IPv6Address"),
+                "NETWORK_MEMBER",
+                allow_empty=True,
+            ),
+        })
+    return {
+        **listed,
+        "members": sorted(members, key=lambda member: member["id"]),
+        "membership_data_available": membership_data_available,
+    }
+
+
+def reconcile_network_membership(networks, containers):
+    containers_by_id = {container["id"]: container for container in containers}
+    results = {}
+    for name in (DATA, EDGE):
+        network = dict(networks[name])
+        members = []
+        member_ids = set()
+        partial_cross_check = False
+        for raw_member in network["members"]:
+            member = dict(raw_member)
+            container = containers_by_id.get(member["id"])
+            if container is None:
+                fail("NETWORK_MEMBER")
+            configured = container["configured_networks"].get(name)
+            if configured is None:
+                fail("NETWORK_MEMBER_CONFIGURATION")
+            if configured["network_id"]:
+                if configured["network_id"] != network["id"]:
+                    fail("NETWORK_MEMBER_CONFIGURATION")
+                network_status = "MATCH"
+                configured_endpoint = configured["endpoint_id"]
+                if configured["network_id_status"] != "VERIFIED":
+                    network_status = "UNAVAILABLE"
+                    partial_cross_check = True
+            else:
+                network_status = "UNAVAILABLE"
+                configured_endpoint = configured["endpoint_id"]
+                partial_cross_check = True
+            observed_endpoint = member["endpoint_id"]
+            if configured_endpoint and observed_endpoint:
+                if configured_endpoint != observed_endpoint:
+                    fail("NETWORK_ENDPOINT_MISMATCH")
+                endpoint_status = "MATCH"
+            else:
+                endpoint_status = "UNAVAILABLE"
+                partial_cross_check = True
+            member["cross_check"] = {
+                "network_id": network_status,
+                "endpoint_id": endpoint_status,
+            }
+            members.append(member)
+            member_ids.add(member["id"])
+
+        unavailable_stopped_members = []
+        if name == DATA:
+            for container in containers:
+                configured = container["configured_networks"].get(name)
+                if configured is None:
+                    fail("CONTAINER_NETWORK_CONFIGURATION")
+                if configured["network_id"] and configured["network_id"] != network["id"]:
+                    fail("CONTAINER_NETWORK_CONFIGURATION")
+                if container["id"] in member_ids:
+                    continue
+                if network["membership_data_available"] and configured["endpoint_id"]:
+                    fail("NETWORK_MEMBER_MISSING")
+                state = container["state"]
+                if (
+                    state["status"] != "exited"
+                    or state["running"] is not False
+                    or state["restarting"] is not False
+                ):
+                    fail("NETWORK_MEMBER_MISSING")
+                unavailable_stopped_members.append({
+                    "id": container["id"],
+                    "service": container["service"],
+                    "reason": (
+                        "CONTAINER_NETWORK_ID_UNAVAILABLE"
+                        if not configured["network_id"]
+                        else "NETWORK_INSPECT_MEMBERSHIP_UNAVAILABLE"
+                        if not network["membership_data_available"]
+                        else "STOPPED_ENDPOINT_NOT_RETURNED_BY_NETWORK_INSPECT"
+                    ),
+                })
+
+        if unavailable_stopped_members:
+            membership_status = "STOPPED_ENDPOINTS_UNAVAILABLE"
+        elif not network["membership_data_available"]:
+            membership_status = "MEMBERSHIP_UNAVAILABLE"
+        elif partial_cross_check:
+            membership_status = "OBSERVED_WITH_PARTIAL_CONTAINER_CROSS_CHECK"
+        elif members:
+            membership_status = "OBSERVED"
+        else:
+            membership_status = "OBSERVED_EMPTY"
+        network["members"] = members
+        network["membership_status"] = membership_status
+        network["unavailable_stopped_members"] = unavailable_stopped_members
+        results[name] = network
+    return results
 
 
 def volume_summary(value):
@@ -533,31 +664,36 @@ def volume_inspection(value, listed):
 def normalized_mount(value):
     obj = require_map_keys(
         value,
-        ("Type", "Name", "Source", "Destination", "Driver", "Mode", "RW", "Propagation"),
+        ("Type", "Source", "Destination", "Mode", "RW", "Propagation"),
         "MOUNT_INVALID",
     )
     mount_type = require_string(obj["Type"], "MOUNT_INVALID")
     if mount_type not in ("volume", "bind", "tmpfs"):
         fail("MOUNT_INVALID")
-    name = require_string(obj["Name"], "MOUNT_INVALID", allow_empty=True)
     source = require_string(obj["Source"], "MOUNT_INVALID", allow_empty=True)
     destination = require_string(obj["Destination"], "MOUNT_INVALID")
     if not destination.startswith("/"):
         fail("MOUNT_INVALID")
-    driver = require_string(obj["Driver"], "MOUNT_INVALID", allow_empty=True)
     mode = require_string(obj["Mode"], "MOUNT_INVALID", allow_empty=True)
     read_write = require_bool(obj["RW"], "MOUNT_INVALID")
     propagation = require_string(obj["Propagation"], "MOUNT_INVALID", allow_empty=True)
-    return {
+    result = {
         "type": mount_type,
-        "name": name,
         "source": source,
         "destination": destination,
-        "driver": driver,
         "mode": mode,
         "rw": read_write,
         "propagation": propagation,
     }
+    if mount_type == "volume":
+        result["name"] = require_string(obj.get("Name"), "MOUNT_INVALID")
+        result["driver"] = require_string(obj.get("Driver"), "MOUNT_INVALID")
+    else:
+        if "Name" in obj:
+            result["name"] = require_string(obj["Name"], "MOUNT_INVALID", allow_empty=True)
+        if "Driver" in obj:
+            result["driver"] = require_string(obj["Driver"], "MOUNT_INVALID", allow_empty=True)
+    return result
 
 
 def normalized_container(service, ident, value, networks, volume):
@@ -608,19 +744,23 @@ def normalized_container(service, ident, value, networks, volume):
     network_map = require_dict(network_settings.get("Networks"), "CONTAINER_NETWORKS")
     if set(network_map) != {DATA}:
         fail("CONTAINER_NETWORKS")
-    configured_network = require_dict(network_map.get(DATA), "CONTAINER_NETWORKS")
+    configured_network = require_dict(network_map[DATA], "CONTAINER_NETWORKS")
     network_id = require_string(
         configured_network.get("NetworkID"),
         "CONTAINER_NETWORKS",
         allow_empty=True,
     )
+    if network_id:
+        network_id = docker_id(network_id, "CONTAINER_NETWORKS")
+        if network_id != networks[DATA]["id"]:
+            fail("CONTAINER_NETWORKS")
     endpoint_id = require_string(
         configured_network.get("EndpointID"),
         "CONTAINER_NETWORKS",
         allow_empty=True,
     )
-    if network_id and docker_id(network_id, "CONTAINER_NETWORKS") != networks[DATA]["id"]:
-        fail("CONTAINER_NETWORKS")
+    if endpoint_id:
+        endpoint_id = docker_id(endpoint_id, "CONTAINER_NETWORKS")
     ip_address = require_string(
         configured_network.get("IPAddress"),
         "CONTAINER_NETWORKS",
@@ -638,6 +778,21 @@ def normalized_container(service, ident, value, networks, volume):
     )
     aliases = require_list(configured_network.get("Aliases"), "CONTAINER_NETWORKS")
     aliases = [require_string(alias, "CONTAINER_NETWORKS") for alias in aliases]
+    network_configuration_status = (
+        "OBSERVED" if network_id and endpoint_id else "PARTIALLY_AVAILABLE"
+    )
+    configured_networks = {
+        DATA: {
+            "network_id": network_id,
+            "network_id_status": "VERIFIED" if network_id else "UNAVAILABLE",
+            "endpoint_id": endpoint_id,
+            "endpoint_id_status": "VERIFIED" if endpoint_id else "UNAVAILABLE",
+            "ip_address": ip_address,
+            "ipv6_address": ipv6_address,
+            "mac_address": mac_address,
+            "aliases": sorted(aliases),
+        },
+    }
 
     raw_mounts = require_list(obj.get("Mounts"), "CONTAINER_MOUNTS")
     mounts = [normalized_mount(mount) for mount in raw_mounts]
@@ -647,7 +802,7 @@ def normalized_container(service, ident, value, networks, volume):
     mounts = sorted(mounts, key=lambda mount: (
         mount["destination"],
         mount["type"],
-        mount["name"],
+        mount.get("name", ""),
         mount["source"],
     ))
     volume_mounts = [mount for mount in mounts if mount["type"] == "volume"]
@@ -718,16 +873,8 @@ def normalized_container(service, ident, value, networks, volume):
             "maximum_retry_count": restart_policy_count,
             "classification": "RECORDED_NOT_INTERPRETED",
         },
-        "configured_networks": {
-            DATA: {
-                "network_id": network_id,
-                "endpoint_id": endpoint_id,
-                "ip_address": ip_address,
-                "ipv6_address": ipv6_address,
-                "mac_address": mac_address,
-                "aliases": sorted(aliases),
-            },
-        },
+        "network_configuration_status": network_configuration_status,
+        "configured_networks": configured_networks,
         "mounts": mounts,
         "postgres_volume_attachment": postgres_attachment,
         "stopped_state_match": profile_match,
@@ -738,8 +885,22 @@ def collect_container_list():
     return container_inventory(get_json(CONTAINERS_PATH))
 
 
-def collect_networks(container_ids):
-    return network_inventory(get_json(NETWORKS_PATH), container_ids)
+def collect_networks():
+    global verified_network_ids
+    networks = network_inventory(get_json(NETWORKS_PATH))
+    verified_network_ids = {network["id"] for network in networks.values()}
+    return networks
+
+
+def inspect_networks(networks, container_ids):
+    return {
+        name: network_inspection(
+            get_json(NETWORK_INSPECT_PREFIX + networks[name]["id"]),
+            networks[name],
+            container_ids,
+        )
+        for name in (DATA, EDGE)
+    }
 
 
 def collect_volume():
@@ -782,12 +943,14 @@ def emit_report(report):
 
 
 def main():
-    global deadline, request_count, total_response_bytes, verified_ids, version_accepted
+    global deadline, request_count, total_response_bytes, verified_ids
+    global verified_network_ids, version_accepted
     started_at = safe_utc_now()
     deadline = time.monotonic() + TOTAL_SECONDS
     request_count = 0
     total_response_bytes = 0
     verified_ids = set()
+    verified_network_ids = set()
     version_accepted = False
     try:
         check_version(get_json("/version"))
@@ -795,7 +958,8 @@ def main():
 
         containers_before = collect_container_list()
         verified_ids = set(containers_before.values())
-        networks_before = collect_networks(containers_before)
+        networks_before = collect_networks()
+        network_details_before = inspect_networks(networks_before, containers_before)
         volume_list_before = collect_volume()
         volume_before = inspect_volume(volume_list_before)
         containers_detail_before = inspect_containers(
@@ -803,13 +967,18 @@ def main():
             networks_before,
             volume_before,
         )
+        reconciled_networks_before = reconcile_network_membership(
+            network_details_before,
+            containers_detail_before,
+        )
 
         containers_after = collect_container_list()
         if containers_after != containers_before:
             fail("CONTAINER_INVENTORY_CHANGED")
-        networks_after = collect_networks(containers_after)
+        networks_after = collect_networks()
         if networks_after != networks_before:
             fail("NETWORKS_CHANGED")
+        network_details_after = inspect_networks(networks_after, containers_after)
         volume_list_after = collect_volume()
         if volume_list_after != volume_list_before:
             fail("VOLUME_LIST_CHANGED")
@@ -823,8 +992,15 @@ def main():
         )
         if containers_detail_after != containers_detail_before:
             fail("CONTAINER_STATE_OR_MOUNTS_CHANGED")
+        reconciled_networks_after = reconcile_network_membership(
+            network_details_after,
+            containers_detail_after,
+        )
+        if reconciled_networks_after != reconciled_networks_before:
+            fail("NETWORKS_CHANGED")
 
         containers = containers_detail_after
+        networks = reconciled_networks_after
         all_containers_stopped_state_match = all(
             container["stopped_state_match"] for container in containers
         )
@@ -856,7 +1032,7 @@ def main():
             ],
             "objects": {
                 "containers": containers,
-                "networks": list(networks_after.values()),
+                "networks": list(networks.values()),
                 "volumes": [volume_after],
             },
         }
