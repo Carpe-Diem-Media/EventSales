@@ -58,7 +58,7 @@ For this procedure, the first wrapper invocation is treated as consuming the aut
 
 ## Proposed preparation and installation commands
 
-These commands are instructions for a future separately authorized operation. Do not run them as part of this PR. Use the repository root at the pinned base commit and a private local staging directory. The approved VPS SSH alias must be named by the owner; this document does not select a host or provide credentials.
+These commands are instructions for a future separately authorized operation. The human owner runs them; do not run them as part of this PR. The coding agent must not initiate SSH/SCP or other privileged VPS operations and must never receive root credentials. Use the repository root at the pinned base commit and a private local staging directory. The owner must name an existing approved SSH alias that connects as `root`; this document does not select a host or provide credentials.
 
 On the source workstation, create private copies from the exact commit and compare the printed SHA-256 values with the table above:
 
@@ -71,30 +71,32 @@ git show fade6a58024ba4e21f2a7bbcf887f6d8ec58c9ae:deploy/vps/operator/agent-vps-
 sha256sum "$SOURCE_DIR/agent-vps-d0-current-state-inspect" "$SOURCE_DIR/agent-vps-d0-current-state-once"
 ```
 
-Stop if either digest differs. After the owner names the approved SSH alias, create a new operator-owned upload directory at `/home/agentops/.eventsales-g4-8-upload`, mode `0700`, and refuse to reuse an existing path. The `agentops` account name follows the current operator convention. Stop if that account or home path does not exist as expected. Replace the quoted placeholder below with the alias recorded in the owner authorization. Run the first command from the workstation to create the directory as `agentops`, then transfer only these two files:
+Stop if either digest differs. The human owner must use the existing owner-approved root SSH alias from the workstation. Create a new, exclusive root-owned upload directory at `/root/.eventsales-g4-8-upload` with mode `0700`; never reuse an existing path. Replace the quoted placeholder below with the exact root SSH alias named in the owner authorization. The first command verifies the remote account and home, then creates the directory without replacing an existing path. Transfer only the two pinned files:
 
 ```sh
-ssh '<approved-ssh-alias>' 'test ! -e /home/agentops/.eventsales-g4-8-upload && test ! -L /home/agentops/.eventsales-g4-8-upload && mkdir -m 0700 /home/agentops/.eventsales-g4-8-upload'
-scp -- "$SOURCE_DIR/agent-vps-d0-current-state-inspect" "$SOURCE_DIR/agent-vps-d0-current-state-once" '<approved-ssh-alias>:/home/agentops/.eventsales-g4-8-upload/'
+ssh '<approved-root-ssh-alias>' 'set -eu; umask 077; test "$(id -un)" = root; test "$HOME" = /root; test ! -e /root/.eventsales-g4-8-upload; test ! -L /root/.eventsales-g4-8-upload; mkdir -m 0700 /root/.eventsales-g4-8-upload'
+scp -- "$SOURCE_DIR/agent-vps-d0-current-state-inspect" "$SOURCE_DIR/agent-vps-d0-current-state-once" '<approved-root-ssh-alias>:/root/.eventsales-g4-8-upload/'
 rm -- "$SOURCE_DIR/agent-vps-d0-current-state-inspect" "$SOURCE_DIR/agent-vps-d0-current-state-once"
 rmdir -- "$SOURCE_DIR"
 ```
 
-Using the already authorized root path, verify the upload directory is owned by `agentops`, mode `0700`, and contains only the two expected regular files owned by `agentops` with mode `0600`. Confirm `/usr/local/sbin` is a root-owned directory that is not group- or world-writable, and `/root` is `root:root 0700`. The two final paths, `/root/.eventsales-g4-8-install`, the evidence directory, and `/etc/sudoers.d/agent-vps-d0-current-state-once` must be absent. Any unexpected path or permission is a STOP condition. Do not overwrite or delete it.
+If directory creation, SCP, or verification fails, stop as `BLOCKED_INSTALL`. Do not retry into or reuse the upload directory. Under the installation approval, remove only uploaded files that still match the exact expected type, owner, mode, and pinned digest; remove the directory only when it is empty. If any path or file is unexpected, preserve it and request an owner decision before another transfer.
+
+Using the owner-authorized root connection, verify the upload directory is `root:root` mode `0700` and contains only the two expected regular, non-symlink files, each `root:root` mode `0600`. Confirm `/usr/local/sbin` is a root-owned directory that is not group- or world-writable, and `/root` is `root:root 0700`. The two final paths, `/root/.eventsales-g4-8-install`, the evidence directory, and `/etc/sudoers.d/agent-vps-d0-current-state-once` must be absent. Any unexpected path or permission is a STOP condition. Do not overwrite or delete it.
 
 ```sh
-sudo -- stat -c '%U:%G %a %F %n' /usr/local/sbin /root /home/agentops/.eventsales-g4-8-upload /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-once
+sudo -- stat -c '%U:%G %a %F %n' /usr/local/sbin /root /root/.eventsales-g4-8-upload /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-once
 sudo -- test -d /usr/local/sbin
 sudo -- test ! -L /usr/local/sbin
 sudo -- test -d /root
 sudo -- test ! -L /root
-sudo -- test -d /home/agentops/.eventsales-g4-8-upload
-sudo -- test ! -L /home/agentops/.eventsales-g4-8-upload
-sudo -- test -f /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect
-sudo -- test ! -L /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect
-sudo -- test -f /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-once
-sudo -- test ! -L /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-once
-sudo -- find /home/agentops/.eventsales-g4-8-upload -mindepth 1 -maxdepth 1 -printf '%f\n'
+sudo -- test -d /root/.eventsales-g4-8-upload
+sudo -- test ! -L /root/.eventsales-g4-8-upload
+sudo -- test -f /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect
+sudo -- test ! -L /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect
+sudo -- test -f /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-once
+sudo -- test ! -L /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-once
+sudo -- find /root/.eventsales-g4-8-upload -mindepth 1 -maxdepth 1 -printf '%f\n'
 for path in /usr/local/sbin/agent-vps-d0-current-state-inspect /usr/local/sbin/agent-vps-d0-current-state-once /root/.eventsales-g4-8-install /root/eventsales-d0-current-state-once /etc/sudoers.d/agent-vps-d0-current-state-once; do
   sudo -- test ! -e "$path" || exit 1
   sudo -- test ! -L "$path" || exit 1
@@ -105,8 +107,8 @@ Create a fresh root-only staging directory, copy the uploaded files into it with
 
 ```sh
 sudo -- mkdir -m 0700 /root/.eventsales-g4-8-install
-sudo -- install -o root -g root -m 0600 /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect
-sudo -- install -o root -g root -m 0600 /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-once /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once
+sudo -- install -o root -g root -m 0600 /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect
+sudo -- install -o root -g root -m 0600 /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-once /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once
 sudo -- sha256sum /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once
 ```
 
@@ -196,15 +198,15 @@ Successful file-level verification is a later, separately authorized review acti
 
 ## Cleanup and failure handling
 
-After a captured attempt, confirm each installed file is a regular non-symlink `root:root 0755` file and compare its digest with the pinned value. Confirm each root staging file is a regular non-symlink `root:root 0600` file and each upload is a regular non-symlink `agentops`-owned `0600` file; compare all staged-file digests with the same pins. Under the installation approval, remove only these exact files if their type, owner, mode, and digest still match:
+After a captured attempt, confirm each installed file is a regular non-symlink `root:root 0755` file and compare its digest with the pinned value. Confirm each root staging file is a regular non-symlink `root:root 0600` file and each upload is a regular non-symlink `root:root 0600` file; compare all staged-file digests with the same pins. Under the installation approval, remove only these exact files if their type, owner, mode, and digest still match:
 
 ```text
 /usr/local/sbin/agent-vps-d0-current-state-inspect
 /usr/local/sbin/agent-vps-d0-current-state-once
 /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect
 /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once
-/home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect
-/home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-once
+/root/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect
+/root/.eventsales-g4-8-upload/agent-vps-d0-current-state-once
 ```
 
 Then remove only the empty G4.8 staging directories and confirm both installed paths are absent. The future cleanup commands, after the digest checks pass, are:
@@ -213,7 +215,7 @@ Then remove only the empty G4.8 staging directories and confirm both installed p
 sudo -- rm -- /usr/local/sbin/agent-vps-d0-current-state-inspect /usr/local/sbin/agent-vps-d0-current-state-once
 sudo -- rm -- /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once
 sudo -- rmdir -- /root/.eventsales-g4-8-install
-ssh '<approved-ssh-alias>' 'rm -- /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-once && rmdir -- /home/agentops/.eventsales-g4-8-upload'
+ssh '<approved-root-ssh-alias>' 'set -eu; test "$(id -un)" = root; test "$HOME" = /root; rm -- /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-once; rmdir -- /root/.eventsales-g4-8-upload'
 sudo -- test ! -e /usr/local/sbin/agent-vps-d0-current-state-inspect
 sudo -- test ! -e /usr/local/sbin/agent-vps-d0-current-state-once
 sudo -- test ! -e /etc/sudoers.d/agent-vps-d0-current-state-once
