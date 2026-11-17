@@ -37,6 +37,8 @@ Two owner approvals are required and must be recorded separately:
 1. **Installation approval** names the exact base commit, both hashes, both installed paths, root ownership and modes, transfer and cleanup paths, and the operator using an existing owner-approved administrative root path. It authorizes file transfer and installation only. It does not authorize executing the collector or reading Docker state.
 2. **Read authorization** names the exact no-argument wrapper command, one attempt, the fixed Docker socket, the protected output path, the 55-second wrapper limit, the output limits below, and the terminal failure rules. It authorizes this collector's bounded Docker `GET` requests and capture only. It does not authorize a person to open or export the resulting raw evidence.
 
+The root SSH upload route is a change from an agentops transfer. Any earlier approval for an agentops upload does not authorize this route. The owner must approve the root SSH alias and exact root upload and cleanup paths before transfer.
+
 Use an owner-operated, already authorized root session for installation and the single wrapper invocation. Do not add a sudoers rule for this task. The existing exact-command grants for other D0 audit tools do not authorize either G4.8 component and must not be changed or reused. If the owner cannot use an existing administrative root path, stop and seek a separately reviewed privilege decision. Do not improvise a temporary grant.
 
 The later human or tool access to the protected capture requires a third, separate evidence-review authorization. Neither approval above grants it.
@@ -58,9 +60,11 @@ For this procedure, the first wrapper invocation is treated as consuming the aut
 
 ## Proposed preparation and installation commands
 
-These commands are instructions for a future separately authorized operation. Do not run them as part of this PR. Use the repository root at the pinned base commit and a private local staging directory. The approved VPS SSH alias must be named by the owner; this document does not select a host or provide credentials.
+These commands are instructions for a future separately authorized operation. The human owner runs them; do not run them as part of this PR. The coding agent must not initiate SSH/SCP or other privileged VPS operations and must never receive root credentials. The owner must name an existing approved SSH alias that connects as `root` to the approved VPS. The host key must already be verified against the owner's trusted record; use normal OpenSSH host-key checking and stop if the key is unknown or changed. Do not accept an unverified key or disable host-key checking. This document does not select a host or provide credentials.
 
-On the source workstation, create private copies from the exact commit and compare the printed SHA-256 values with the table above:
+### Workstation source verification and transfer
+
+**WORKSTATION — local source verification.** Use the repository root at the pinned base commit and a private local staging directory. Compare both SHA-256 values with the table above:
 
 ```sh
 set -eu
@@ -71,102 +75,141 @@ git show fade6a58024ba4e21f2a7bbcf887f6d8ec58c9ae:deploy/vps/operator/agent-vps-
 sha256sum "$SOURCE_DIR/agent-vps-d0-current-state-inspect" "$SOURCE_DIR/agent-vps-d0-current-state-once"
 ```
 
-Stop if either digest differs. After the owner names the approved SSH alias, create a new operator-owned upload directory at `/home/agentops/.eventsales-g4-8-upload`, mode `0700`, and refuse to reuse an existing path. The `agentops` account name follows the current operator convention. Stop if that account or home path does not exist as expected. Replace the quoted placeholder below with the alias recorded in the owner authorization. Run the first command from the workstation to create the directory as `agentops`, then transfer only these two files:
+Stop if either digest differs.
+
+**WORKSTATION — owner-operated root SSH/SCP transfer.** Run this block on the workstation. The one-shot `ssh` command creates the upload directory on the VPS and exits back to the workstation. `scp` runs from the workstation and transfers only the two pinned files. The owner must replace the alias placeholder with the exact root SSH alias named in the installation approval.
 
 ```sh
-ssh '<approved-ssh-alias>' 'test ! -e /home/agentops/.eventsales-g4-8-upload && test ! -L /home/agentops/.eventsales-g4-8-upload && mkdir -m 0700 /home/agentops/.eventsales-g4-8-upload'
-scp -- "$SOURCE_DIR/agent-vps-d0-current-state-inspect" "$SOURCE_DIR/agent-vps-d0-current-state-once" '<approved-ssh-alias>:/home/agentops/.eventsales-g4-8-upload/'
+ssh '<approved-root-ssh-alias>' 'set -eu; umask 077; test "$(id -un)" = root; test "$HOME" = /root; test ! -e /root/.eventsales-g4-8-upload; test ! -L /root/.eventsales-g4-8-upload; mkdir -m 0700 /root/.eventsales-g4-8-upload'
+scp -- "$SOURCE_DIR/agent-vps-d0-current-state-inspect" "$SOURCE_DIR/agent-vps-d0-current-state-once" '<approved-root-ssh-alias>:/root/.eventsales-g4-8-upload/'
 rm -- "$SOURCE_DIR/agent-vps-d0-current-state-inspect" "$SOURCE_DIR/agent-vps-d0-current-state-once"
 rmdir -- "$SOURCE_DIR"
 ```
 
-Using the already authorized root path, verify the upload directory is owned by `agentops`, mode `0700`, and contains only the two expected regular files owned by `agentops` with mode `0600`. Confirm `/usr/local/sbin` is a root-owned directory that is not group- or world-writable, and `/root` is `root:root 0700`. The two final paths, `/root/.eventsales-g4-8-install`, the evidence directory, and `/etc/sudoers.d/agent-vps-d0-current-state-once` must be absent. Any unexpected path or permission is a STOP condition. Do not overwrite or delete it.
+If directory creation, SCP, or verification fails, stop as `BLOCKED_INSTALL`. Do not retry into or reuse the upload directory. Under the installation approval, remove only uploaded files that still match the exact expected type, owner, mode, and pinned digest; remove the directory only when it is empty. If any path or file is unexpected, preserve it and request an owner decision before another transfer.
+
+After SCP and local source cleanup finish, open an interactive VPS root session from the workstation. Do not pass a remote command. Keep this session open through preflight, installation, temporary-name removal, and final `STAGED` checks. Stop at the first failed check or command. If the session closes or a command fails before `STAGED`, stop as `BLOCKED_INSTALL`; preserve remaining paths and do not retry. No collector invocation is allowed in this session.
+
+**WORKSTATION — open VPS root session A.** Run this from the workstation after transfer succeeds. It opens an interactive shell:
 
 ```sh
-sudo -- stat -c '%U:%G %a %F %n' /usr/local/sbin /root /home/agentops/.eventsales-g4-8-upload /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-once
-sudo -- test -d /usr/local/sbin
-sudo -- test ! -L /usr/local/sbin
-sudo -- test -d /root
-sudo -- test ! -L /root
-sudo -- test -d /home/agentops/.eventsales-g4-8-upload
-sudo -- test ! -L /home/agentops/.eventsales-g4-8-upload
-sudo -- test -f /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect
-sudo -- test ! -L /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect
-sudo -- test -f /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-once
-sudo -- test ! -L /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-once
-sudo -- find /home/agentops/.eventsales-g4-8-upload -mindepth 1 -maxdepth 1 -printf '%f\n'
-for path in /usr/local/sbin/agent-vps-d0-current-state-inspect /usr/local/sbin/agent-vps-d0-current-state-once /root/.eventsales-g4-8-install /root/eventsales-d0-current-state-once /etc/sudoers.d/agent-vps-d0-current-state-once; do
-  sudo -- test ! -e "$path" || exit 1
-  sudo -- test ! -L "$path" || exit 1
-done
+ssh '<approved-root-ssh-alias>'
 ```
 
-Create a fresh root-only staging directory, copy the uploaded files into it with fixed modes, and verify their digests before installation:
-
-```sh
-sudo -- mkdir -m 0700 /root/.eventsales-g4-8-install
-sudo -- install -o root -g root -m 0600 /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect
-sudo -- install -o root -g root -m 0600 /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-once /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once
-sudo -- sha256sum /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once
-```
-
-Only after both staging digests match, prepare root-owned temporary regular files in `/usr/local/sbin`. Run the next three command blocks in the same persistent owner-authorized shell so `$TMP_INSPECT` and `$TMP_ONCE` remain available through verified removal. Do not enter `STAGED` if that shell ends before temporary-name removal and the final-file recheck. The absent-path checks are diagnostic only. For each executable, `ln -T` publishes a same-filesystem hard link atomically and fails if the exact destination already exists, including when it is a symlink or directory. Do not use ordinary `install`, `cp`, or `mv` on either final path, and do not add `-f` to `ln`. Publication is atomic per file, not as a pair; the second publication can fail after the first succeeds.
+**VPS ROOT SESSION A — preflight.** At the VPS prompt, confirm the account and home before checking privileged paths. Verify the upload directory is `root:root` mode `0700` and contains only the two expected regular, non-symlink `root:root` files at mode `0600`. `/usr/local/sbin` must be a root-owned directory that is not group- or world-writable, and `/root` must be `root:root 0700`. The final paths, install staging directory, evidence directory, and G4.8 sudoers path must be absent. Stop on any mismatch; do not overwrite or remove an unexpected path.
 
 ```sh
 set -eu
-TMP_INSPECT="$(sudo -- mktemp /usr/local/sbin/.agent-vps-d0-current-state-inspect.g4-8.XXXXXX)"
-sudo -- stat -c '%U:%G %a %F %d:%i %n' "$TMP_INSPECT"
-TMP_ONCE="$(sudo -- mktemp /usr/local/sbin/.agent-vps-d0-current-state-once.g4-8.XXXXXX)"
-sudo -- stat -c '%U:%G %a %F %d:%i %n' "$TMP_ONCE"
-sudo -- test -f "$TMP_INSPECT"
-sudo -- test ! -L "$TMP_INSPECT"
-sudo -- test -f "$TMP_ONCE"
-sudo -- test ! -L "$TMP_ONCE"
-sudo -- cp -- /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect "$TMP_INSPECT"
-sudo -- cp -- /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once "$TMP_ONCE"
-sudo -- chown root:root "$TMP_INSPECT" "$TMP_ONCE"
-sudo -- stat -c '%U:%G %a %F %d:%i %n' "$TMP_INSPECT" "$TMP_ONCE"
-sudo -- sha256sum "$TMP_INSPECT" "$TMP_ONCE"
+test "$(id -un)" = root
+test "$HOME" = /root
+stat -c '%U:%G %a %F %n' /usr/local/sbin /root /root/.eventsales-g4-8-upload /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-once
+test -d /usr/local/sbin
+test ! -L /usr/local/sbin
+test "$(stat -c '%U:%G' /usr/local/sbin)" = root:root
+test -z "$(find /usr/local/sbin -maxdepth 0 -perm /0022 -print)"
+test ! -L /root
+test "$(stat -c '%U:%G %a %F' /root)" = 'root:root 700 directory'
+test "$(stat -c '%U:%G %a %F' /root/.eventsales-g4-8-upload)" = 'root:root 700 directory'
+test ! -L /root/.eventsales-g4-8-upload
+test "$(stat -c '%U:%G %a %F' /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect)" = 'root:root 600 regular file'
+test "$(stat -c '%U:%G %a %F' /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-once)" = 'root:root 600 regular file'
+test ! -L /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect
+test ! -L /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-once
+test "$(find /root/.eventsales-g4-8-upload -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" = "$(printf '%s\n' agent-vps-d0-current-state-inspect agent-vps-d0-current-state-once)"
+for path in /usr/local/sbin/agent-vps-d0-current-state-inspect /usr/local/sbin/agent-vps-d0-current-state-once /root/.eventsales-g4-8-install /root/eventsales-d0-current-state-once /etc/sudoers.d/agent-vps-d0-current-state-once; do
+  test ! -e "$path" || exit 1
+  test ! -L "$path" || exit 1
+done
 ```
 
-Record each temporary path and its device/inode (`%d:%i`) immediately after its exclusive `mktemp` creation. Require both temporary files to remain regular non-symlinks, `root:root`, mode `600`, and to match their pinned hashes. Only after both hashes match, make the verified files executable and publish them:
+**VPS ROOT SESSION A — root-owned staging.** The exclusive `mkdir` fails if the staging path already exists. Verify the output hashes against the two pins before continuing:
 
 ```sh
-sudo -- chmod 0755 "$TMP_INSPECT" "$TMP_ONCE"
-sudo -- stat -c '%U:%G %a %F %d:%i %n' "$TMP_INSPECT" "$TMP_ONCE"
-sudo -- ln -T -- "$TMP_INSPECT" /usr/local/sbin/agent-vps-d0-current-state-inspect
-sudo -- ln -T -- "$TMP_ONCE" /usr/local/sbin/agent-vps-d0-current-state-once
-sudo -- stat -c '%U:%G %a %h %F %d:%i %n' "$TMP_INSPECT" /usr/local/sbin/agent-vps-d0-current-state-inspect "$TMP_ONCE" /usr/local/sbin/agent-vps-d0-current-state-once
-sudo -- sha256sum /usr/local/sbin/agent-vps-d0-current-state-inspect /usr/local/sbin/agent-vps-d0-current-state-once
+set -eu
+mkdir -m 0700 /root/.eventsales-g4-8-install
+install -o root -g root -m 0600 /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect
+install -o root -g root -m 0600 /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-once /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once
+sha256sum /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once
+```
+
+Only after both staging digests match, prepare root-owned temporary regular files in `/usr/local/sbin`. Run the following VPS ROOT SESSION A blocks in the same persistent shell so `$TMP_INSPECT` and `$TMP_ONCE` remain available through verified removal. Do not enter `STAGED` if that shell ends before temporary-name removal and the final-file recheck. The absent-path checks are diagnostic only. For each executable, `ln -T` publishes a same-filesystem hard link atomically and fails if the exact destination already exists, including when it is a symlink or directory. Do not use ordinary `install`, `cp`, or `mv` on either final path, and do not add `-f` to `ln`. Publication is atomic per file, not as a pair; the second publication can fail after the first succeeds.
+
+**VPS ROOT SESSION A — prepare temporary files.**
+
+```sh
+set -eu
+TMP_INSPECT="$(mktemp /usr/local/sbin/.agent-vps-d0-current-state-inspect.g4-8.XXXXXX)"
+stat -c '%U:%G %a %F %d:%i %n' "$TMP_INSPECT"
+TMP_ONCE="$(mktemp /usr/local/sbin/.agent-vps-d0-current-state-once.g4-8.XXXXXX)"
+stat -c '%U:%G %a %F %d:%i %n' "$TMP_ONCE"
+test -f "$TMP_INSPECT"
+test ! -L "$TMP_INSPECT"
+test -f "$TMP_ONCE"
+test ! -L "$TMP_ONCE"
+cp -- /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect "$TMP_INSPECT"
+cp -- /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once "$TMP_ONCE"
+chown root:root "$TMP_INSPECT" "$TMP_ONCE"
+stat -c '%U:%G %a %F %d:%i %n' "$TMP_INSPECT" "$TMP_ONCE"
+sha256sum "$TMP_INSPECT" "$TMP_ONCE"
+```
+
+Record each temporary path and its device/inode (`%d:%i`) immediately after its exclusive `mktemp` creation. Require both temporary files to remain regular non-symlinks, `root:root`, mode `600`, and to match their pinned hashes. Only after both hashes match, make the verified files executable and publish them.
+
+**VPS ROOT SESSION A — atomic no-replace publication.**
+
+```sh
+set -eu
+chmod 0755 "$TMP_INSPECT" "$TMP_ONCE"
+stat -c '%U:%G %a %F %d:%i %n' "$TMP_INSPECT" "$TMP_ONCE"
+ln -T -- "$TMP_INSPECT" /usr/local/sbin/agent-vps-d0-current-state-inspect
+ln -T -- "$TMP_ONCE" /usr/local/sbin/agent-vps-d0-current-state-once
+stat -c '%U:%G %a %h %F %d:%i %n' "$TMP_INSPECT" /usr/local/sbin/agent-vps-d0-current-state-inspect "$TMP_ONCE" /usr/local/sbin/agent-vps-d0-current-state-once
+sha256sum /usr/local/sbin/agent-vps-d0-current-state-inspect /usr/local/sbin/agent-vps-d0-current-state-once
 ```
 
 Before cleanup, require each temporary and final path to be a regular non-symlink, `root:root`, mode `755`, have the pinned digest, share the same recorded device/inode, and have link count `2`. If either `ln -T` fails, stop; do not try another publication command or execute either file. If the first final link was created but the second publication fails, remove the first final path only when it is still a regular non-symlink `root:root 0755` file, its hash matches the pinned collector digest, and its device/inode still matches `$TMP_INSPECT`. Then verify that exact path is absent. Never remove or alter the destination that caused `ln -T` to fail. If rollback succeeds, remove the two recorded temporary names only if each still has its recorded device/inode and remains a regular non-symlink `root:root` file. Verify both temporary names are absent and the final path removed by rollback remains absent. If any rollback condition or absence check fails, leave remaining paths untouched and record `BLOCKED_INSTALL`.
 
-If publication fails before any final link is made, remove only the temporary paths recorded from this attempt, and only when each remains a regular non-symlink `root:root` file with the same device/inode recorded immediately after its exclusive `mktemp` creation. The content may be incomplete if preparation failed; the recorded inode identifies the file created by this attempt. Verify each exact path is absent after removal. After both final links pass verification, remove only the two recorded temporary link names using the following commands, in the same shell that set the variables:
+If publication fails before any final link is made, remove only the temporary paths recorded from this attempt, and only when each remains a regular non-symlink `root:root` file with the same device/inode recorded immediately after its exclusive `mktemp` creation. The content may be incomplete if preparation failed; the recorded inode identifies the file created by this attempt. Verify each exact path is absent after removal. After both final links pass verification, remove only the two recorded temporary link names in the same VPS ROOT SESSION A shell that set the variables.
+
+**VPS ROOT SESSION A — remove temporary hard-link names and verify final files.**
 
 ```sh
-sudo -- unlink -- "$TMP_INSPECT"
-sudo -- unlink -- "$TMP_ONCE"
-sudo -- test ! -e "$TMP_INSPECT"
-sudo -- test ! -L "$TMP_INSPECT"
-sudo -- test ! -e "$TMP_ONCE"
-sudo -- test ! -L "$TMP_ONCE"
-sudo -- test -f /usr/local/sbin/agent-vps-d0-current-state-inspect
-sudo -- test ! -L /usr/local/sbin/agent-vps-d0-current-state-inspect
-sudo -- test -f /usr/local/sbin/agent-vps-d0-current-state-once
-sudo -- test ! -L /usr/local/sbin/agent-vps-d0-current-state-once
-sudo -- stat -c '%U:%G %a %h %F %d:%i %n' /usr/local/sbin/agent-vps-d0-current-state-inspect /usr/local/sbin/agent-vps-d0-current-state-once
-sudo -- sha256sum /usr/local/sbin/agent-vps-d0-current-state-inspect /usr/local/sbin/agent-vps-d0-current-state-once
+set -eu
+unlink -- "$TMP_INSPECT"
+unlink -- "$TMP_ONCE"
+test ! -e "$TMP_INSPECT"
+test ! -L "$TMP_INSPECT"
+test ! -e "$TMP_ONCE"
+test ! -L "$TMP_ONCE"
+test -f /usr/local/sbin/agent-vps-d0-current-state-inspect
+test ! -L /usr/local/sbin/agent-vps-d0-current-state-inspect
+test -f /usr/local/sbin/agent-vps-d0-current-state-once
+test ! -L /usr/local/sbin/agent-vps-d0-current-state-once
+stat -c '%U:%G %a %h %F %d:%i %n' /usr/local/sbin/agent-vps-d0-current-state-inspect /usr/local/sbin/agent-vps-d0-current-state-once
+sha256sum /usr/local/sbin/agent-vps-d0-current-state-inspect /usr/local/sbin/agent-vps-d0-current-state-once
 ```
 
 Require both temporary names to be absent and both final files to retain their pre-unlink device/inode, `root:root` ownership, mode `755`, and pinned hashes. Require each final file's link count to be `1`, proving only its approved final path remains. A cleanup mismatch, command failure, or final-file change is `BLOCKED_INSTALL`; preserve remaining paths for an owner decision. Do not use a wildcard for temporary-file cleanup. Do not proceed to `STAGED` or `READ_AUTHORIZED` until removal, absence checks, and final-file rechecks pass. No collector invocation occurs during staging or installation.
 
+When the final paths pass those checks, state is `STAGED`. Close VPS ROOT SESSION A by entering `exit`. Do not keep it open while waiting for read authorization.
+
 ## One-time execution and capture
 
-After the separate read authorization, invoke only:
+After separate read authorization, the owner opens a new interactive root session from the workstation. Do not reuse VPS ROOT SESSION A. At the VPS prompt, verify `id -un` is `root` and `HOME` is `/root`. Keep the session open for the one wrapper invocation and, if already covered by the installation approval, the guarded cleanup below. Do not run `sudo` or nested SSH from this shell.
+
+**WORKSTATION — open VPS root session B after read authorization.** Run from the workstation with no remote command:
 
 ```sh
-sudo -- /usr/local/sbin/agent-vps-d0-current-state-once
+ssh '<approved-root-ssh-alias>'
+```
+
+**VPS ROOT SESSION B — one-time read.** Run the exact command from the VPS root prompt:
+
+```sh
+set -eu
+test "$(id -un)" = root
+test "$HOME" = /root
+/usr/local/sbin/agent-vps-d0-current-state-once
 ```
 
 Pass no arguments. Do not add `timeout`, `tee`, redirection, a shell trace, or an environment override. The wrapper internally clears the environment and enforces its deadlines. It prints only `D0_CAPTURE=COMPLETE` or `D0_CAPTURE=INCOMPLETE STOP=<fixed-code>`.
@@ -176,6 +219,8 @@ The collector allows at most 19 Docker API requests, each with a 3-second reques
 `D0_CAPTURE=COMPLETE` means the pinned collector exited successfully and the wrapper completed its bounded capture. It does not accept the D0 baseline. An incomplete result, timeout, output overflow, signal, collector digest mismatch, existing evidence directory, or missing/invalid file is terminal. The wrapper retains whatever protected files it could write. Do not rerun the wrapper, invoke the collector directly, or remove or repair the evidence directory.
 
 The wrapper creates `/root/eventsales-d0-current-state-once` exclusively at mode `0700`, with `collector.stdout`, `collector.stderr`, and `metadata.json` at mode `0600`, all owned by `root:root`. The stdout file contains the collector JSON and must be treated as sensitive. Do not use `cat`, `jq`, shell substitution, a terminal pager, Git, or a general-purpose upload on it.
+
+After recording only the fixed classification, close VPS ROOT SESSION B unless the installation approval expressly covers the guarded cleanup below. If it does, perform that cleanup in the same VPS root session and then close it. Do not inspect the evidence files. A lost session or unknown wrapper result consumes the read authorization and must not be retried.
 
 ## Capture verification, review, and redaction
 
@@ -196,30 +241,72 @@ Successful file-level verification is a later, separately authorized review acti
 
 ## Cleanup and failure handling
 
-After a captured attempt, confirm each installed file is a regular non-symlink `root:root 0755` file and compare its digest with the pinned value. Confirm each root staging file is a regular non-symlink `root:root 0600` file and each upload is a regular non-symlink `agentops`-owned `0600` file; compare all staged-file digests with the same pins. Under the installation approval, remove only these exact files if their type, owner, mode, and digest still match:
+Cleanup runs only in a VPS root session. The installation approval must name the exact cleanup paths. Cleanup applies after a captured attempt or after the owner records a no-execution cleanup because read authorization was withheld. Do not run any VPS path command in the workstation shell. Do not use `sudo` or nested SSH in a VPS root session.
 
-```text
-/usr/local/sbin/agent-vps-d0-current-state-inspect
-/usr/local/sbin/agent-vps-d0-current-state-once
-/root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect
-/root/.eventsales-g4-8-install/agent-vps-d0-current-state-once
-/home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect
-/home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-once
-```
+If VPS ROOT SESSION B remains open and the installation approval covers cleanup, use that session. Otherwise, after confirming cleanup is authorized, the owner opens a new interactive root session from the workstation:
 
-Then remove only the empty G4.8 staging directories and confirm both installed paths are absent. The future cleanup commands, after the digest checks pass, are:
+**WORKSTATION — open a cleanup-only VPS root session, if needed.** Do not pass a remote command:
 
 ```sh
-sudo -- rm -- /usr/local/sbin/agent-vps-d0-current-state-inspect /usr/local/sbin/agent-vps-d0-current-state-once
-sudo -- rm -- /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once
-sudo -- rmdir -- /root/.eventsales-g4-8-install
-ssh '<approved-ssh-alias>' 'rm -- /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect /home/agentops/.eventsales-g4-8-upload/agent-vps-d0-current-state-once && rmdir -- /home/agentops/.eventsales-g4-8-upload'
-sudo -- test ! -e /usr/local/sbin/agent-vps-d0-current-state-inspect
-sudo -- test ! -e /usr/local/sbin/agent-vps-d0-current-state-once
-sudo -- test ! -e /etc/sudoers.d/agent-vps-d0-current-state-once
+ssh '<approved-root-ssh-alias>'
 ```
 
-Do not remove `/root/eventsales-d0-current-state-once` or any file beneath it. No G4.8 sudoers entry is expected or permitted. If a digest changed, a path is unexpected, a cleanup command fails, or the sudoers check finds an entry, stop as `BLOCKED_CLEANUP`; preserve evidence and request a new owner decision. Do not broaden cleanup to nearby files or directories.
+**VPS ROOT SESSION — verify cleanup identities.** Run this at the VPS root prompt. It checks all six exact files for type, symlink status, owner, mode, and pinned digest, and checks the two staging directories and their exact contents. If any check fails, stop as `BLOCKED_CLEANUP`; do not run the removal block.
+
+```sh
+set -eu
+test "$(id -un)" = root
+test "$HOME" = /root
+check_dir() {
+  test "$(stat -c '%U:%G %a %F' "$1")" = 'root:root 700 directory'
+  test ! -L "$1"
+}
+check_file() {
+  path="$1"
+  expected_mode="$2"
+  expected_hash="$3"
+  test "$(stat -c '%U:%G %a %F' "$path")" = "$expected_mode"
+  test ! -L "$path"
+  actual_hash="$(sha256sum "$path")"
+  actual_hash="${actual_hash%% *}"
+  test "$actual_hash" = "$expected_hash"
+}
+check_dir /root/.eventsales-g4-8-install
+check_dir /root/.eventsales-g4-8-upload
+check_file /usr/local/sbin/agent-vps-d0-current-state-inspect 'root:root 755 regular file' '91e7f6adce032f514eeff512998952b623b20232e95d71b3cf00e4fc4c15a124'
+check_file /usr/local/sbin/agent-vps-d0-current-state-once 'root:root 755 regular file' 'b566ad95284eb58f714531c56da090cbf640a3799c4beb033b04e14067a4f56f'
+check_file /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect 'root:root 600 regular file' '91e7f6adce032f514eeff512998952b623b20232e95d71b3cf00e4fc4c15a124'
+check_file /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once 'root:root 600 regular file' 'b566ad95284eb58f714531c56da090cbf640a3799c4beb033b04e14067a4f56f'
+check_file /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect 'root:root 600 regular file' '91e7f6adce032f514eeff512998952b623b20232e95d71b3cf00e4fc4c15a124'
+check_file /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-once 'root:root 600 regular file' 'b566ad95284eb58f714531c56da090cbf640a3799c4beb033b04e14067a4f56f'
+test "$(find /root/.eventsales-g4-8-install -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" = "$(printf '%s\n' agent-vps-d0-current-state-inspect agent-vps-d0-current-state-once)"
+test "$(find /root/.eventsales-g4-8-upload -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" = "$(printf '%s\n' agent-vps-d0-current-state-inspect agent-vps-d0-current-state-once)"
+test ! -e /etc/sudoers.d/agent-vps-d0-current-state-once
+test ! -L /etc/sudoers.d/agent-vps-d0-current-state-once
+```
+
+**VPS ROOT SESSION — remove only verified G4.8 files.** Run this in the same root session only after every preceding identity check passes. `rmdir` fails if either directory contains an unexpected entry.
+
+```sh
+set -eu
+rm -- /usr/local/sbin/agent-vps-d0-current-state-inspect /usr/local/sbin/agent-vps-d0-current-state-once
+rm -- /root/.eventsales-g4-8-install/agent-vps-d0-current-state-inspect /root/.eventsales-g4-8-install/agent-vps-d0-current-state-once
+rmdir -- /root/.eventsales-g4-8-install
+rm -- /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-inspect /root/.eventsales-g4-8-upload/agent-vps-d0-current-state-once
+rmdir -- /root/.eventsales-g4-8-upload
+test ! -e /usr/local/sbin/agent-vps-d0-current-state-inspect
+test ! -L /usr/local/sbin/agent-vps-d0-current-state-inspect
+test ! -e /usr/local/sbin/agent-vps-d0-current-state-once
+test ! -L /usr/local/sbin/agent-vps-d0-current-state-once
+test ! -e /root/.eventsales-g4-8-install
+test ! -L /root/.eventsales-g4-8-install
+test ! -e /root/.eventsales-g4-8-upload
+test ! -L /root/.eventsales-g4-8-upload
+test ! -e /etc/sudoers.d/agent-vps-d0-current-state-once
+test ! -L /etc/sudoers.d/agent-vps-d0-current-state-once
+```
+
+Do not remove `/root/eventsales-d0-current-state-once` or any file beneath it. No G4.8 sudoers entry is expected or permitted. If a digest changed, a path is unexpected, a cleanup command fails, or the sudoers check finds an entry, stop as `BLOCKED_CLEANUP`; preserve evidence and request a new owner decision. Do not broaden cleanup to nearby files or directories. After successful cleanup, close the VPS root session with `exit`.
 
 For a lost SSH session or unknown wrapper result, treat the authorization as consumed. Do not invoke again. Preserve the evidence path if it exists and wait for a separately authorized evidence review. If no evidence path exists, record the result as unknown and require a new review and explicit authorization before another attempt.
 
